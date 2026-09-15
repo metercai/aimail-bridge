@@ -56,8 +56,7 @@ Works for both push and pull modes.
 - **Per-IP rate limiting** — configurable req/sec cap with sliding window (default 30)
 - **Body size limit** — configurable cap (default 20 MB) prevents memory exhaustion
 - **Header filtering** — only business headers forwarded (`x-aimail-email`,
-  `x-aimail-timestamp`, `x-webhook-signature`, `x-mailrelay-timestamp`,
-  `content-type`)
+  `x-aimail-timestamp`, `x-webhook-signature`, `content-type`)
 - **Graceful shutdown** — SIGINT/SIGTERM drain in-flight requests
 - **Connection pooling** — reqwest client reused across all forwards (keep-alive)
 - **HSTS on TLS only** — no HSTS header on plain HTTP (RFC 6797 compliance)

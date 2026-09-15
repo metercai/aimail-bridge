@@ -25,9 +25,9 @@ admin_allowed_ips = ["127.0.0.1", "::1"]   # Admin API IP whitelist
 # Headers passed through to the gateway from gateway.
 # Single mode: whitelist filter (only listed headers are forwarded).
 # Batch mode: listed headers are built from batch entry fields.
-# Supported names: x-aimail-email, x-webhook-signature, x-mailrelay-timestamp, content-type
+# Supported names: x-aimail-email, x-aimail-timestamp, x-webhook-signature, content-type
 # Default: the AIMail gateway standard headers (x-aimail-email, x-aimail-timestamp, x-webhook-signature, content-type)
-# forward_headers = ["x-aimail-email", "x-webhook-signature", "x-mailrelay-timestamp", "content-type"]
+# forward_headers = ["x-aimail-email", "x-aimail-timestamp", "x-webhook-signature", "content-type"]
 
 # ── Push mode (bridge receives external POSTs) ────────────────────
 # [push]

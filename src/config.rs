@@ -162,7 +162,6 @@ fn default_forward_headers() -> Vec<String> {
     vec![
         "X-AIMail-Email".into(),
         "X-AIMail-Timestamp".into(),
-        "X-Mailrelay-Timestamp".into(), // 中转协议兼容名
         "X-Webhook-Signature".into(),
         "content-type".into(),
     ]

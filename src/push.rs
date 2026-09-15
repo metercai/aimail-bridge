@@ -308,11 +308,10 @@ fn batch_header_value(
     sig: &str,
     ts: &str,
 ) -> Option<(&'static str, String)> {
-    // 中转协议兼容名归一到 AIMail 业务名输出(调用方按输出名去重)。
     match name {
         "X-AIMail-Email" => Some(("X-AIMail-Email", email.to_string())),
         "X-Webhook-Signature" => Some(("X-Webhook-Signature", sig.to_string())),
-        "X-AIMail-Timestamp" | "X-Mailrelay-Timestamp" => Some(("X-AIMail-Timestamp", ts.to_string())),
+        "X-AIMail-Timestamp" => Some(("X-AIMail-Timestamp", ts.to_string())),
         "content-type" => Some(("content-type", "application/json".to_string())),
         _ => None,
     }

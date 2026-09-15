@@ -42,7 +42,7 @@ pub async fn start_pull_loop(
     const ACK_FAIL_WARN_THRESHOLD: u32 = 10;
 
     tracing::info!(
-        amail_url = %pull_cfg.amail_url,
+        aimail_url = %pull_cfg.aimail_url,
         system_id = %pull_cfg.system_id,
         poll_interval_sec = pull_cfg.poll_interval_sec,
         "Starting pull loop"
@@ -239,7 +239,7 @@ async fn fetch_pending(state: &PullState) -> Result<Vec<PendingBatch>, Box<dyn s
 
     let url = format!(
         "{}/api/v1/admin/pending",
-        state.pull_cfg.amail_url.trim_end_matches('/'),
+        state.pull_cfg.aimail_url.trim_end_matches('/'),
     );
     let body_json = serde_json::json!({
         "limit": 50,
@@ -274,7 +274,7 @@ async fn fetch_pending(state: &PullState) -> Result<Vec<PendingBatch>, Box<dyn s
 async fn ack_deliveries(state: &PullState, ids: &[i64]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!(
         "{}/api/v1/admin/pending/ack",
-        state.pull_cfg.amail_url.trim_end_matches('/'),
+        state.pull_cfg.aimail_url.trim_end_matches('/'),
     );
 
     let ack_body = serde_json::to_vec(&serde_json::json!({ "ids": ids }))?;

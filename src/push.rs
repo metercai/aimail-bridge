@@ -238,13 +238,13 @@ async fn check_rate_limit(
 
 /// Transparent webhook proxy.
 ///
-/// Relay sends:  POST /webhooks/amail-inbound
+/// Relay sends:  POST /webhooks/aimail-inbound
 ///               X-AIMail-Email: alice@admin.relay
 ///               X-Webhook-Signature: sha256=...
 ///               {payload}
 ///
 /// Bridge: looks up `alice@admin.relay` → port 8645,
-/// forwards body + headers verbatim to `127.0.0.1:8645/webhooks/amail-inbound`.
+/// forwards body + headers verbatim to `127.0.0.1:8645/webhooks/aimail-inbound`.
 async fn handle_webhook(
     State(state): State<PushState>,
     headers: HeaderMap,
@@ -258,10 +258,9 @@ async fn handle_webhook(
         }
     }
 
-    // ── Single mode (X-AIMail-Email header; legacy X-Amail-Email 回退) ──
+    // ── Single mode (X-AIMail-Email header) ──
     let email = match headers
         .get("X-AIMail-Email")
-        .or_else(|| headers.get("X-Amail-Email"))
         .and_then(|v| v.to_str().ok())
     {
         Some(e) => e.to_string(),
@@ -309,9 +308,9 @@ fn batch_header_value(
     sig: &str,
     ts: &str,
 ) -> Option<(&'static str, String)> {
-    // 新旧配置名都归一到新名输出(名单新旧并存期, 调用方按输出名去重)。
+    // 中转协议兼容名归一到 AIMail 业务名输出(调用方按输出名去重)。
     match name {
-        "X-AIMail-Email" | "X-Amail-Email" => Some(("X-AIMail-Email", email.to_string())),
+        "X-AIMail-Email" => Some(("X-AIMail-Email", email.to_string())),
         "X-Webhook-Signature" => Some(("X-Webhook-Signature", sig.to_string())),
         "X-AIMail-Timestamp" | "X-Mailrelay-Timestamp" => Some(("X-AIMail-Timestamp", ts.to_string())),
         "content-type" => Some(("content-type", "application/json".to_string())),

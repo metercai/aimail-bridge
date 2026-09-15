@@ -16,7 +16,7 @@ admin_allowed_ips = ["127.0.0.1", "::1"]   # Admin API IP whitelist
 
 # ── Pull mode (bridge polls gateway outbound) ───────────────────────
 # [pull]
-# amail_url = "http://192.168.1.1:38080"  # Gateway HTTP API URL
+# aimail_url = "http://192.168.1.1:38080"  # Gateway HTTP API URL
 # admin_key = "sk-..."                    # System admin API key from gateway
 # system_id = "admin"                     # System ID for pending-query (default: "admin")
 # poll_interval_sec = 10                  # Poll interval in seconds (default: 10)
@@ -25,9 +25,9 @@ admin_allowed_ips = ["127.0.0.1", "::1"]   # Admin API IP whitelist
 # Headers passed through to the gateway from gateway.
 # Single mode: whitelist filter (only listed headers are forwarded).
 # Batch mode: listed headers are built from batch entry fields.
-# Supported names: x-amail-email, x-webhook-signature, x-mailrelay-timestamp, content-type
-# Default: all four amail gateway standard headers
-# forward_headers = ["x-amail-email", "x-webhook-signature", "x-mailrelay-timestamp", "content-type"]
+# Supported names: x-aimail-email, x-webhook-signature, x-mailrelay-timestamp, content-type
+# Default: the AIMail gateway standard headers (x-aimail-email, x-aimail-timestamp, x-webhook-signature, content-type)
+# forward_headers = ["x-aimail-email", "x-webhook-signature", "x-mailrelay-timestamp", "content-type"]
 
 # ── Push mode (bridge receives external POSTs) ────────────────────
 # [push]

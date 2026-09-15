@@ -321,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_path_traversal_blocked() {
         // Create temporary test file
-        let tmp = std::env::temp_dir().join("amail_bridge_traversal_test");
+        let tmp = std::env::temp_dir().join("aimail_bridge_traversal_test");
         let _ = std::fs::create_dir_all(&tmp);
         let sub = tmp.join("sub");
         let _ = std::fs::create_dir_all(&sub);

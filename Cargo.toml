@@ -1,9 +1,9 @@
 [package]
 name = "aimail-bridge"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Transparent bridge between amail relay and Hermes gateway"
+description = "Transparent push/pull bridge between the AIMail gateway and local agent systems"
 
 [dependencies]
 axum = "0.7"

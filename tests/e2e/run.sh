@@ -303,7 +303,7 @@ bind = "127.0.0.1:${BP2}"
 routes_file = "$WORK_DIR/bridge/aimail_routes.toml"
 mode = "pull"
 [pull]
-amail_url = "127.0.0.1:${RH2}"
+aimail_url = "127.0.0.1:${RH2}"
 admin_key = "${SYSPULL}"
 system_id = "admin"
 poll_interval_sec = 2
@@ -417,8 +417,8 @@ routes_file = "$WORK_DIR/bridge/aimail_routes.toml"
 mode = "pull"
 [pull]
 systems = [
-  { amail_url = "127.0.0.1:${RH2}", admin_key = "${SYSPULL}", system_id = "admin", poll_interval_sec = 2 },
-  { amail_url = "127.0.0.1:${RH4}", admin_key = "${SYSPULL2}", system_id = "admin", poll_interval_sec = 2 },
+  { aimail_url = "127.0.0.1:${RH2}", admin_key = "${SYSPULL}", system_id = "admin", poll_interval_sec = 2 },
+  { aimail_url = "127.0.0.1:${RH4}", admin_key = "${SYSPULL2}", system_id = "admin", poll_interval_sec = 2 },
 ]
 [logging]
 level = "info"

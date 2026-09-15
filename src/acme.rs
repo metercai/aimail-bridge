@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_check_existing_cert_missing() {
-        let dir = std::env::temp_dir().join(format!("amail_acme_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aimail_acme_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(check_existing_cert("example.com", &dir).is_none());
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_check_existing_cert_fresh() {
-        let dir = std::env::temp_dir().join(format!("amail_acme_test2_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aimail_acme_test2_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("example.com.cert.pem"), "cert").unwrap();

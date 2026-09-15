@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_route_target_key_bare_hostport() {
-        // Legacy bare host:port route → target_url has /webhooks/amail-inbound
+        // Legacy bare host:port route → target_url has /webhooks/aimail-inbound
         let router = ProfileRouter::new(std::path::PathBuf::from("/nonexistent/routes.toml"));
         router.update_route("e@x.com", "127.0.0.1", 8645);
         let r = router.list_routes().pop().unwrap();

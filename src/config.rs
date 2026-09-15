@@ -57,7 +57,7 @@ pub struct BridgeConfig {
     /// Forward headers that bridge passes through to gateway.
     /// Single mode: whitelist filter (only these headers are forwarded).
     /// Batch mode: per-recipient headers built from entry fields.
-    /// Default: standard amail relay headers.
+    /// Default: standard AIMail relay headers.
     #[serde(default = "default_forward_headers")]
     pub forward_headers: Vec<String>,
 
@@ -158,13 +158,11 @@ fn default_rate_limit() -> u32 { 30 }
 fn default_body_limit() -> u32 { 20 }
 
 fn default_forward_headers() -> Vec<String> {
-    // 新名在前; 旧名保留至过渡清理(agent/gateway 全量升级后删除)。
-    // 单投模式只复制"在场"的头, 新旧不会同时出现, 无重复。
+    // 只转发 AIMail 业务头; 单投模式只复制"在场"的头, 不会产生重复。
     vec![
         "X-AIMail-Email".into(),
         "X-AIMail-Timestamp".into(),
-        "X-Amail-Email".into(),         // legacy (transition)
-        "X-Mailrelay-Timestamp".into(), // legacy (transition)
+        "X-Mailrelay-Timestamp".into(), // 中转协议兼容名
         "X-Webhook-Signature".into(),
         "content-type".into(),
     ]
@@ -185,7 +183,7 @@ pub struct VhostSiteConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullConfig {
     #[serde(default)]
-    pub amail_url: String,
+    pub aimail_url: String,
     #[serde(default)]
     pub admin_key: String,
     #[serde(default)]
@@ -207,7 +205,7 @@ pub struct PullConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullSystemConfig {
     #[serde(default)]
-    pub amail_url: String,
+    pub aimail_url: String,
     #[serde(default)]
     pub admin_key: String,
     #[serde(default)]
@@ -241,7 +239,7 @@ impl PullConfig {
             return self.systems.clone();
         }
         vec![PullSystemConfig {
-            amail_url: self.amail_url.clone(),
+            aimail_url: self.aimail_url.clone(),
             admin_key: self.admin_key.clone(),
             api_key: self.api_key.clone(),
             poll_interval_sec: self.poll_interval_sec,
@@ -310,7 +308,7 @@ fn default_admin_allowed_ips() -> Vec<String> {
 impl Default for PullConfig {
     fn default() -> Self {
         Self {
-            amail_url: String::new(),
+            aimail_url: String::new(),
             admin_key: String::new(),
             api_key: String::new(),
             poll_interval_sec: 10,
@@ -336,7 +334,7 @@ impl BridgeConfig {
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_HOSTNAME") {
             if !v.is_empty() { cfg.hostname = Some(v); }
         }
-        if let Ok(v) = std::env::var("AIMAIL_GATEWAY_URL") { cfg.pull.amail_url = v; }
+        if let Ok(v) = std::env::var("AIMAIL_GATEWAY_URL") { cfg.pull.aimail_url = v; }
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_ADMIN_KEY") { cfg.pull.admin_key = v; }
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_SYSTEM_ID") { cfg.pull.system_id = v; }
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_POLL_SECS") {
@@ -356,16 +354,16 @@ impl BridgeConfig {
         cfg.default_profile_dir = hermes_root;
         cfg.routes_file = config_path.parent().unwrap_or(Path::new(".")).join("aimail_routes.toml");
 
-        // Normalize amail_url: add http:// if no scheme present
-        if !cfg.pull.amail_url.contains("://") && !cfg.pull.amail_url.is_empty() {
-            cfg.pull.amail_url = format!("http://{}", cfg.pull.amail_url);
+        // Normalize aimail_url: add http:// if no scheme present
+        if !cfg.pull.aimail_url.contains("://") && !cfg.pull.aimail_url.is_empty() {
+            cfg.pull.aimail_url = format!("http://{}", cfg.pull.aimail_url);
         }
         // Same normalization for each entry of the multi-system array —
         // otherwise reqwest gets a URL without scheme and the pull loop
         // dies with "builder error" (AUDIT-2 / e2e M-Q caught this).
         for sys in &mut cfg.pull.systems {
-            if !sys.amail_url.contains("://") && !sys.amail_url.is_empty() {
-                sys.amail_url = format!("http://{}", sys.amail_url);
+            if !sys.aimail_url.contains("://") && !sys.aimail_url.is_empty() {
+                sys.aimail_url = format!("http://{}", sys.aimail_url);
             }
         }
 
@@ -376,8 +374,8 @@ impl BridgeConfig {
     pub fn validate(&self) {
         if self.mode == "pull" {
             for (i, sys) in self.pull.resolved_systems().iter().enumerate() {
-                if sys.amail_url.is_empty() {
-                    tracing::warn!(system_index = i, "pull.systems[{}].amail_url is empty — pull loop will fail", i);
+                if sys.aimail_url.is_empty() {
+                    tracing::warn!(system_index = i, "pull.systems[{}].aimail_url is empty — pull loop will fail", i);
                 }
                 if sys.admin_key.is_empty() && sys.api_key.is_empty() {
                     tracing::warn!(system_index = i, "pull.systems[{}] has no admin_key/api_key — authentication will fail", i);
@@ -405,7 +403,7 @@ mod tests {
         let cfg: BridgeConfig = toml::from_str(r#"
 mode = "pull"
 [pull]
-amail_url = "http://x"
+aimail_url = "http://x"
 admin_key = "k"
 system_id = "s"
 "#).unwrap();
@@ -512,11 +510,11 @@ redirect = "https://www.example.com"
         let cfg: BridgeConfig = toml::from_str(r#"
 mode = "pull"
 [pull]
-amail_url = ""
+aimail_url = ""
 admin_key = ""
 system_id = ""
 "#).unwrap();
-        assert!(cfg.pull.amail_url.is_empty());
+        assert!(cfg.pull.aimail_url.is_empty());
         assert!(cfg.pull.admin_key.is_empty());
         assert!(cfg.pull.system_id.is_empty());
     }
@@ -526,7 +524,7 @@ system_id = ""
         let cfg: BridgeConfig = toml::from_str(r#"
 mode = "pull"
 [pull]
-amail_url = "http://x"
+aimail_url = "http://x"
 admin_key = "k"
 system_id = "s"
 "#).unwrap();
@@ -540,8 +538,8 @@ system_id = "s"
 mode = "pull"
 [pull]
 systems = [
-    { amail_url = "https://a.tm", admin_key = "ka", system_id = "sys-a", poll_interval_sec = 2 },
-    { amail_url = "https://b.tm", admin_key = "kb", system_id = "sys-b", poll_interval_sec = 5 },
+    { aimail_url = "https://a.tm", admin_key = "ka", system_id = "sys-a", poll_interval_sec = 2 },
+    { aimail_url = "https://b.tm", admin_key = "kb", system_id = "sys-b", poll_interval_sec = 5 },
 ]
 "#).unwrap();
         let systems = cfg.pull.resolved_systems();
@@ -555,23 +553,23 @@ systems = [
     #[test]
     fn test_pull_multi_system_url_normalized() {
         // systems[] entries without scheme must get http:// (e2e M-Q caught
-        // "builder error" when they didn't — flat amail_url was normalized
+        // "builder error" when they didn't — flat aimail_url was normalized
         // but the array entries were not).
-        let path = std::env::temp_dir().join("amail_bridge_norm_test.toml");
+        let path = std::env::temp_dir().join("aimail_bridge_norm_test.toml");
         std::fs::write(&path, r#"
 mode = "pull"
 [pull]
 systems = [
-  { amail_url = "127.0.0.1:39011", admin_key = "ka", system_id = "sys-a" },
-  { amail_url = "https://b.tm", admin_key = "kb", system_id = "sys-b" },
+  { aimail_url = "127.0.0.1:39011", admin_key = "ka", system_id = "sys-a" },
+  { aimail_url = "https://b.tm", admin_key = "kb", system_id = "sys-b" },
 ]
 "#).unwrap();
         let cfg = BridgeConfig::load(Some(&path)).unwrap();
         std::fs::remove_file(&path).ok();
         let systems = cfg.pull.resolved_systems();
-        assert_eq!(systems[0].amail_url, "http://127.0.0.1:39011",
+        assert_eq!(systems[0].aimail_url, "http://127.0.0.1:39011",
                    "scheme-less entry gets http:// prefix");
-        assert_eq!(systems[1].amail_url, "https://b.tm",
+        assert_eq!(systems[1].aimail_url, "https://b.tm",
                    "entry with explicit scheme untouched");
     }
 
@@ -580,7 +578,7 @@ systems = [
         let cfg: BridgeConfig = toml::from_str(r#"
 mode = "pull"
 [pull]
-amail_url = "https://a.tm"
+aimail_url = "https://a.tm"
 admin_key = "legacy-key"
 system_id = "legacy-sys"
 "#).unwrap();
@@ -589,7 +587,7 @@ system_id = "legacy-sys"
         assert_eq!(systems.len(), 1, "legacy flat fields synthesize one system");
         assert_eq!(systems[0].system_id, "legacy-sys");
         assert_eq!(systems[0].effective_key(), "legacy-key");
-        assert_eq!(systems[0].amail_url, "https://a.tm");
+        assert_eq!(systems[0].aimail_url, "https://a.tm");
     }
 
     #[test]
@@ -598,7 +596,7 @@ system_id = "legacy-sys"
 mode = "pull"
 [pull]
 systems = [
-    { amail_url = "https://a.tm", admin_key = "ka", api_key = "ak", system_id = "sys-a" },
+    { aimail_url = "https://a.tm", admin_key = "ka", api_key = "ak", system_id = "sys-a" },
 ]
 "#).unwrap();
         let systems = cfg.pull.resolved_systems();

@@ -1,4 +1,4 @@
-//! aimail-bridge — transparent bridge between amail relay and Hermes gateway.
+//! aimail-bridge — transparent bridge between the AIMail gateway and local agent systems.
 //!
 //! Two modes:
 //! - **push**: expose a single external endpoint, transparently proxy to gateway webhook ports.

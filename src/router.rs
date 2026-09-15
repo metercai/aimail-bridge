@@ -32,7 +32,7 @@ pub struct ProfileRoute {
     pub port: u16,
     /// Cached target URL — computed once, reused for all lookups.
     /// Either a full URL (registered via API / routes file) or
-    /// `http://{host}:{port}/webhooks/amail-inbound` when only host:port
+    /// `http://{host}:{port}/webhooks/aimail-inbound` when only host:port
     /// was given (legacy default path).
     target_url: String,
 }
@@ -43,7 +43,7 @@ impl ProfileRoute {
     }
 
     /// Build a route from a full URL (scheme://host[:port][/path]).
-    /// The path is preserved verbatim — no `/webhooks/amail-inbound`
+    /// The path is preserved verbatim — no `/webhooks/aimail-inbound`
     /// suffix is appended, so agent endpoints with custom paths
     /// (e.g. OpenClaw `/hook`) work unchanged.
     fn from_url(email: String, url: &str) -> Self {
@@ -75,7 +75,7 @@ impl ProfileRoute {
     }
 
     fn new(email: String, host: String, port: u16) -> Self {
-        let target_url = format!("http://{}:{}/webhooks/amail-inbound", host, port);
+        let target_url = format!("http://{}:{}/webhooks/aimail-inbound", host, port);
         Self { email, host, port, target_url }
     }
 }
@@ -250,7 +250,7 @@ impl ProfileRouter {
     /// Add or update a route for an exact email, then persist to file.
     /// `host_or_url` accepts either a full URL (`http://host:port/path`,
     /// path preserved verbatim) or a bare `host:port` (legacy default
-    /// `/webhooks/amail-inbound` path).
+    /// `/webhooks/aimail-inbound` path).
     pub fn update_route(&self, email: &str, host_or_url: &str, port: u16) {
         let route = if host_or_url.contains('/') || host_or_url.contains("://") {
             ProfileRoute::from_url(email.into(), host_or_url)
@@ -303,9 +303,9 @@ impl ProfileRouter {
         for email in keys {
             if let Some(route) = routes.get(email) {
                 // Persist the full target URL when it carries a custom path
-                // (not the legacy /webhooks/amail-inbound default), so
+                // (not the legacy /webhooks/aimail-inbound default), so
                 // restarts keep exact endpoint paths.
-                let value = if route.target_url.ends_with("/webhooks/amail-inbound")
+                let value = if route.target_url.ends_with("/webhooks/aimail-inbound")
                     && route.target_url.starts_with(&format!("http://{}:{}", route.host, route.port))
                 {
                     format!("{}:{}", route.host, route.port)
@@ -491,7 +491,7 @@ mod tests {
         let r1 = router.lookup("a1@t.local").unwrap();
         assert_eq!(r1.target_url(), "http://127.0.0.1:8799/hook", "full URL path preserved");
         let r2 = router.lookup("a2@t.local").unwrap();
-        assert_eq!(r2.target_url(), "http://127.0.0.1:8002/webhooks/amail-inbound",
+        assert_eq!(r2.target_url(), "http://127.0.0.1:8002/webhooks/aimail-inbound",
             "bare host:port falls back to legacy path");
     }
 

@@ -25,8 +25,6 @@ use crate::router::ProfileRouter;
 pub struct AdminState {
     pub router: Arc<ProfileRouter>,
     pub config: BridgeConfig,
-    #[allow(dead_code)]
-    pub allowed_ips: Vec<(std::net::IpAddr, u8)>,
     pub startup: std::time::Instant,
 }
 
@@ -36,7 +34,6 @@ pub fn build_admin_router(config: &BridgeConfig, router: Arc<ProfileRouter>) -> 
     let state = AdminState {
         router,
         config: config.clone(),
-        allowed_ips: allowed.clone(),
         startup: Instant::now(),
     };
 
@@ -141,7 +138,7 @@ async fn create_route(
 
     let webhook_url = if state.config.mode == "push" {
         let host = state.config.hostname.as_deref().unwrap_or(&state.config.bind);
-        format!("http://{}/webhooks/amail-inbound", host)
+        format!("http://{}/webhooks/aimail-inbound", host)
     } else {
         String::new()
     };

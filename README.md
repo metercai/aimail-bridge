@@ -55,8 +55,9 @@ Works for both push and pull modes.
 - **IP allowlist + blacklist** — push mode accepts POSTs only from trusted source IPs
 - **Per-IP rate limiting** — configurable req/sec cap with sliding window (default 30)
 - **Body size limit** — configurable cap (default 20 MB) prevents memory exhaustion
-- **Header filtering** — only business headers forwarded (`x-amail-email`,
-  `x-webhook-signature`, `x-mailrelay-timestamp`, `content-type`)
+- **Header filtering** — only business headers forwarded (`x-aimail-email`,
+  `x-aimail-timestamp`, `x-webhook-signature`, `x-mailrelay-timestamp`,
+  `content-type`)
 - **Graceful shutdown** — SIGINT/SIGTERM drain in-flight requests
 - **Connection pooling** — reqwest client reused across all forwards (keep-alive)
 - **HSTS on TLS only** — no HSTS header on plain HTTP (RFC 6797 compliance)
@@ -137,7 +138,7 @@ EOF
 cat > aimail_bridge.toml << 'EOF'
 mode = "pull"
 [pull]
-amail_url = "http://gateway.example.com:38080"
+aimail_url = "http://gateway.example.com:38080"
 admin_key = "sk-xxxxxxxx"
 system_id = "admin"
 EOF
@@ -180,7 +181,7 @@ body_limit_mb = 20                    # max request body in MB (default: 20)
 mode = "pull"
 
 [pull]
-amail_url = "http://gateway.example.com:38080"
+aimail_url = "http://gateway.example.com:38080"
 admin_key = "sk-xxxxxxxx"            # system admin API key from gateway
 system_id = "admin"                  # system ID for pending query (default: "admin")
 poll_interval_sec = 10               # poll interval in seconds (default: 10)
@@ -202,7 +203,7 @@ file = "/var/log/aimail-bridge.log"   # log file, stdout if unset (default: none
 |---|---|
 | `AIMAIL_BRIDGE_MODE` | `mode` |
 | `AIMAIL_BRIDGE_HOSTNAME` | `push.hostname` |
-| `AIMAIL_GATEWAY_URL` | `pull.amail_url` |
+| `AIMAIL_GATEWAY_URL` | `pull.aimail_url` |
 | `AIMAIL_BRIDGE_ADMIN_KEY` | `pull.admin_key` |
 | `AIMAIL_BRIDGE_SYSTEM_ID` | `pull.system_id` |
 | `AIMAIL_BRIDGE_POLL_SECS` | `pull.poll_interval_sec` |

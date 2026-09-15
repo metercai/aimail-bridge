@@ -51,8 +51,8 @@ SIGINT/SIGTERM 优雅排空。
 - **IP 白名单 + 黑名单** — push 模式仅接受受信来源 IP 的 POST
 - **每 IP 限速** — 可配置 rps 上限，滑动窗口算法（默认 30）
 - **Body 大小限制** — 可配置上限（默认 20 MB），防止内存耗尽
-- **Header 过滤** — 只转发业务 header（`x-amail-email`, `x-webhook-signature`,
-  `x-mailrelay-timestamp`, `content-type`）
+- **Header 过滤** — 只转发业务 header（`x-aimail-email`、`x-aimail-timestamp`、
+  `x-webhook-signature`、`x-mailrelay-timestamp`、`content-type`）
 - **优雅关闭** — SIGINT/SIGTERM 排空进行中请求
 - **连接池复用** — reqwest client 全局复用，keep-alive 长连接
 - **HSTS 仅 TLS 启用** — 纯 HTTP 不发送 HSTS（RFC 6797 要求浏览器忽略）
@@ -133,7 +133,7 @@ EOF
 cat > aimail_bridge.toml << 'EOF'
 mode = "pull"
 [pull]
-amail_url = "http://gateway.example.com:38080"
+aimail_url = "http://gateway.example.com:38080"
 admin_key = "sk-xxxxxxxx"
 system_id = "admin"
 EOF
@@ -176,7 +176,7 @@ body_limit_mb = 20                    # 请求体最大 MB（默认：20）
 mode = "pull"
 
 [pull]
-amail_url = "http://gateway.example.com:38080"
+aimail_url = "http://gateway.example.com:38080"
 admin_key = "sk-xxxxxxxx"            # gateway 的 system admin API key
 system_id = "admin"                  # pending 查询用的系统 ID（默认："admin"）
 poll_interval_sec = 10               # 轮询间隔秒（默认：10）
@@ -198,7 +198,7 @@ file = "/var/log/aimail-bridge.log"   # 日志文件路径，不设则 stdout
 |---|---|
 | `AIMAIL_BRIDGE_MODE` | `mode` |
 | `AIMAIL_BRIDGE_HOSTNAME` | `push.hostname` |
-| `AIMAIL_GATEWAY_URL` | `pull.amail_url` |
+| `AIMAIL_GATEWAY_URL` | `pull.aimail_url` |
 | `AIMAIL_BRIDGE_ADMIN_KEY` | `pull.admin_key` |
 | `AIMAIL_BRIDGE_SYSTEM_ID` | `pull.system_id` |
 | `AIMAIL_BRIDGE_POLL_SECS` | `pull.poll_interval_sec` |

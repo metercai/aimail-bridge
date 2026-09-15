@@ -15,6 +15,30 @@ source "$SIGN_LIB"
 GW_BIN="${GW_BIN:-$HOME/aimail-gateway/target/debug/aimail-gateway}"
 BRIDGE_BIN="${BRIDGE_BIN:-$PROJECT_DIR/target/debug/aimail-bridge}"
 
+# ── 二进制新鲜度预检 ────────────────────────────────────────────────
+# 用旧二进制跑回归会把「旧二进制读不到新字段」误报成产品 bug(2026-09-15
+# 实测:8 月构建的 bridge + 新配置键 aimail_url → pull 段全 0、push 段全过)。
+# 源码里有比二进制更新的 .rs = 先 cargo build 再跑。
+_stale=""
+if [ -x "$BRIDGE_BIN" ] && [ -d "$PROJECT_DIR/src" ]; then
+    _f=$(find "$PROJECT_DIR/src" -name '*.rs' -newer "$BRIDGE_BIN" -print -quit 2>/dev/null || true)
+    [ -n "$_f" ] && _stale="${_stale}  bridge:  $BRIDGE_BIN 旧于 $_f"$'\n'
+fi
+if [ -x "$GW_BIN" ]; then
+    _gw_root="$(cd "$(dirname "$GW_BIN")/../.." 2>/dev/null && pwd || true)"
+    if [ -n "$_gw_root" ] && [ -d "$_gw_root/src" ]; then
+        _f=$(find "$_gw_root/src" -name '*.rs' -newer "$GW_BIN" -print -quit 2>/dev/null || true)
+        [ -n "$_f" ] && _stale="${_stale}  gateway: $GW_BIN 旧于 $_f"$'\n'
+    fi
+fi
+if [ -n "$_stale" ]; then
+    echo "STALE BINARIES — 结果不可信,先重建:"
+    printf '%s' "$_stale"
+    echo "  (cd $PROJECT_DIR && cargo build)   # bridge"
+    [ -n "${_gw_root:-}" ] && echo "  (cd $_gw_root && cargo build)   # gateway"
+    fail "stale binaries — rebuild and re-run"
+fi
+
 WORK_DIR="${WORK_DIR:-/tmp/bridge-e2e}"
 RS=35010; RH=39010; RS2=35011; RH2=39011; BP=38080; BP2=38081; HP=39999
 # multi-system: second push gateway, second pull gateway, multi-system pull bridge

@@ -28,10 +28,6 @@ jobs:
             platform: linux-arm64
             ext: ""
           # ── macOS (target macOS 11+) ──
-          - target: x86_64-apple-darwin
-            os: macos-13
-            platform: macos-amd64
-            ext: ""
           - target: aarch64-apple-darwin
             os: macos-14
             platform: macos-arm64
@@ -94,7 +90,6 @@ jobs:
             |--------|-----------------|
             | `linux-amd64` | musl, **no runtime deps** |
             | `linux-arm64` | musl, **no runtime deps** |
-            | `macos-amd64` | macOS 11+ (Intel) |
             | `macos-arm64` | macOS 11+ (Apple Silicon) |
             | `windows-amd64` | Windows 10+ |
 

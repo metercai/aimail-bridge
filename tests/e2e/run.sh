@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # v1 signed requests (docs/API-SIGNATURE-PROTOCOL.md) — shared signer lives in
 # the advanced repo's e2e lib; override with SIGN_LIB if relocated.
-SIGN_LIB="${SIGN_LIB:-$HOME/aimail-advanced/tests/lib/amail-sign.sh}"
+SIGN_LIB="${SIGN_LIB:-$HOME/aimail-advanced/tests/lib/aimail-sign.sh}"
 [[ -f "$SIGN_LIB" ]] || fail "shared v1 signer not found: $SIGN_LIB"
 source "$SIGN_LIB"
 GW_BIN="${GW_BIN:-$HOME/aimail-gateway/target/debug/aimail-gateway}"

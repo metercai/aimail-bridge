@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install deps (musl)
-        if: startsWith(matrix.target, 'x86_64-unknown-linux-musl') || startsWith(matrix.target, 'aarch64-unknown-linux-musl')
+        if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Setup Rust
@@ -59,7 +59,9 @@ jobs:
           # musl: setting RUSTFLAGS drops the target's implicit +crt-static, which would
           # yield a dynamically linked musl binary (needs the musl loader on the target).
           # Re-state it explicitly so linux-amd64/arm64 stay self-contained.
-          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64-unknown-linux-musl') || startsWith(matrix.target, 'aarch64-unknown-linux-musl') && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
+          # NB: keep a single contains() test — chaining `a || b && c || d` short-circuits on
+          # the first truthy operand and yields the boolean `true` for the a-targets.
+          RUSTFLAGS: ${{ contains(matrix.target, 'linux-musl') && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
           MACOSX_DEPLOYMENT_TARGET: ${{ contains(matrix.os, 'macos') && '11.0' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 

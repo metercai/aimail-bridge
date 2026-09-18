@@ -138,7 +138,7 @@ async fn acquire_cert_inner(
     let cert_key_path = cache_dir.join(format!("{}.key.pem", domain));
     let cert_path = cache_dir.join(format!("{}.cert.pem", domain));
 
-    let contact = format!("mailto:{}", acme_email.unwrap_or("acme@agent-mail-relay.local"));
+    let contact = format!("mailto:{}", acme_email.unwrap_or("acme@aimail.local"));
     let directory_url = LetsEncrypt::Production.url().to_owned();
     let builder = Account::builder()?;
 

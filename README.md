@@ -59,7 +59,6 @@ Works for both push and pull modes.
   `x-aimail-timestamp`, `x-webhook-signature`, `content-type`)
 - **Graceful shutdown** — SIGINT/SIGTERM drain in-flight requests
 - **Connection pooling** — reqwest client reused across all forwards (keep-alive)
-- **HSTS on TLS only** — no HSTS header on plain HTTP (RFC 6797 compliance)
 
 ### Zero-config automation
 
@@ -67,7 +66,7 @@ Works for both push and pull modes.
 - **inotify hot-reload** — changes to `aimail_routes.toml` are applied immediately
 - **ACME auto-TLS** — set `hostname` → automatic Let's Encrypt certificate
   (HTTP-01 challenge), cached and auto-renewed every ~60 days
-- **Dual-port mode** — `addr` port 80 + `hostname` set → auto 80→443 redirect
+- **Dual-port mode** — `bind` port 80 + `hostname` set → auto 80→443 redirect
 - **Daemon mode** — `--daemon` double-fork, PID file, log file, zero supervision
 
 ---
@@ -90,7 +89,7 @@ gateway ──POST──►      │                                  │
 - Gateway POSTs to a **single port** on bridge; bridge auto-routes by agent email
 - Multiple recipients → gateway sends **one body copy** (batch aggregation)
 - TLS via rustls; automatic Let's Encrypt certificate when `hostname` is set
-- Dual-port mode: `addr = "0.0.0.0:80"` + `hostname = "bridge.example.com"` → auto 80→443
+- Dual-port mode: `bind = "0.0.0.0:80"` + `hostname = "bridge.example.com"` → auto 80→443
 - Real-time: gateway gets immediate HTTP response from agent via bridge
 
 ### Pull — zero ports, email inbound through NAT
@@ -98,7 +97,7 @@ gateway ──POST──►      │                                  │
 ```
 gateway (public)                              behind NAT/firewall
   │                                               │
-  │◄── POST /pending (poll every 10s) ────────────│ bridge (outbound only)
+  │◄── POST /api/v1/admin/pending (poll every 10s) ────────────│ bridge (outbound only)
   │                                               │
   │── batches [{body, deliveries}] ──────────────►│
   │                                               │
@@ -106,11 +105,11 @@ gateway (public)                              behind NAT/firewall
   │                                 │ fan-out to each agent webhook       │
   │                                 │ ACK forwarded deliveries            │
   │                                 └────────────────────────────────────┘
-  │◄── POST /pending/ack ─────────────────────────│
+  │◄── POST /api/v1/admin/pending/ack ─────────────────────────│
 ```
 
 - Single **outbound HTTP connection** to gateway, fully bypasses NAT/firewall
-- **Zero listen sockets** — no ports opened, no inbound traffic at all
+- **No public ports** — loopback admin API only, no inbound traffic at all
 - Same batch aggregation: one body copy serialized once, reused for all recipients
 - ACK-based consumption + 2-hour dedup cache — no messages lost, no duplicates
 - Exponential backoff on fetch failures (max 5 minutes)
@@ -127,18 +126,28 @@ cargo build --release
 # Push mode (single port, all agents)
 cat > aimail_bridge.toml << 'EOF'
 mode = "push"
-[push]
-addr = "0.0.0.0:38080"
+bind = "0.0.0.0:38080"
 hostname = "bridge.example.com"     # enables TLS + ACME auto-cert
+admin_allowed_ips = ["127.0.0.1", "::1"]
+
+[logging]
+level = "info"       # stdout (default is /var/log/aimail-bridge.log without [logging]; non-root fails)
+
+[push]
 allowed_ips = ["10.0.0.0/8"]
 EOF
 
 # Pull mode (zero ports, outbound only)
 cat > aimail_bridge.toml << 'EOF'
 mode = "pull"
+bind = "127.0.0.1:38080"
+
+[logging]
+level = "info"       # stdout (default is /var/log/aimail-bridge.log without [logging]; non-root fails)
+
 [pull]
 aimail_url = "http://gateway.example.com:38080"
-admin_key = "sk-xxxxxxxx"
+admin_key = "sk-xxxxxxxx"           # system-scope key (pending filtered by key's system)
 system_id = "admin"
 EOF
 
@@ -150,7 +159,7 @@ EOF
 
 # Check health
 curl http://localhost:38080/health
-# {"status":"ok","uptime_secs":42,"version":"0.3.0"}
+# {"status":"ok","uptime_secs":42,"version":"0.7.2"}
 ```
 
 ---
@@ -162,12 +171,20 @@ curl http://localhost:38080/health
 ```toml
 mode = "push"
 
-[push]
-addr = "0.0.0.0:38080"                # listen address (default: "0.0.0.0:38080")
-hostname = "bridge.example.com"       # enables TLS + ACME auto-cert
+bind = "0.0.0.0:38080"                # listen address (default: "0.0.0.0:38080")
+hostname = "bridge.example.com"       # public domain — enables TLS (see below)
+admin_allowed_ips = ["127.0.0.1", "::1"]   # admin API whitelist (default: localhost)
+
+# TLS: three ways — pick one
+# 1) hostname + nothing        → ACME auto-cert (Let's Encrypt HTTP-01)
+# 2) hostname + static certs   → use tls_cert / tls_key below
+# 3) no hostname / IP hostname → plain HTTP
 # tls_cert = "/etc/ssl/bridge.crt"   # static TLS cert (optional)
 # tls_key  = "/etc/ssl/bridge.key"   # static TLS key (optional)
-# acme_cache = "./acme_cache"        # ACME cache dir (default: ./acme_cache)
+# acme_email = "admin@example.com"   # ACME contact (optional)
+# acme_cache = "~/.acme_cache"       # ACME cache dir (default: ~/.acme_cache)
+
+[push]
 blacklist_ips = ["1.2.3.4"]          # permanently blocked IPs (default: [])
 allowed_ips = ["10.0.0.0/8"]         # IP allowlist, empty = allow all (default: [])
 rate_limit = 30                       # req/sec per source IP, 0 = disabled (default: 30)
@@ -179,9 +196,12 @@ body_limit_mb = 20                    # max request body in MB (default: 20)
 ```toml
 mode = "pull"
 
+bind = "127.0.0.1:38080"              # listen address (admin API only)
+
 [pull]
 aimail_url = "http://gateway.example.com:38080"
-admin_key = "sk-xxxxxxxx"            # system admin API key from gateway
+admin_key = "sk-xxxxxxxx"            # system-scope key — must belong to the same
+                                     # system as the pending deliveries
 system_id = "admin"                  # system ID for pending query (default: "admin")
 poll_interval_sec = 10               # poll interval in seconds (default: 10)
 ```
@@ -201,14 +221,15 @@ file = "/var/log/aimail-bridge.log"   # log file, stdout if unset (default: none
 | Variable | Equivalent config |
 |---|---|
 | `AIMAIL_BRIDGE_MODE` | `mode` |
-| `AIMAIL_BRIDGE_HOSTNAME` | `push.hostname` |
+| `AIMAIL_BRIDGE_HOSTNAME` | `hostname` (top-level) |
 | `AIMAIL_GATEWAY_URL` | `pull.aimail_url` |
 | `AIMAIL_BRIDGE_ADMIN_KEY` | `pull.admin_key` |
 | `AIMAIL_BRIDGE_SYSTEM_ID` | `pull.system_id` |
 | `AIMAIL_BRIDGE_POLL_SECS` | `pull.poll_interval_sec` |
 | `AIMAIL_BRIDGE_ALLOWED_IPS` | `push.allowed_ips` (comma-separated) |
-| `HERMES_HOME` | Hermes home directory (default `~/.hermes`) |
 | `RUST_LOG` | tracing filter (overrides `logging.level`) |
+
+hermes_home (config field, default `~/.hermes`)
 
 ---
 
@@ -217,7 +238,7 @@ file = "/var/log/aimail-bridge.log"   # log file, stdout if unset (default: none
 Set `hostname` in config for automatic TLS via Let's Encrypt (HTTP-01 challenge).
 Certificate is cached and auto-renewed. Port 80 must be reachable for ACME validation.
 
-**Dual-port mode:** When `addr` is port 80 + `hostname` set, port 80 handles ACME
+**Dual-port mode:** When `bind` is port 80 + `hostname` set, port 80 handles ACME
 challenge + redirects to 443; port 443 serves the application.
 
 ---

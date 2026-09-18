@@ -55,7 +55,6 @@ SIGINT/SIGTERM 优雅排空。
   `x-webhook-signature`、`content-type`）
 - **优雅关闭** — SIGINT/SIGTERM 排空进行中请求
 - **连接池复用** — reqwest client 全局复用，keep-alive 长连接
-- **HSTS 仅 TLS 启用** — 纯 HTTP 不发送 HSTS（RFC 6797 要求浏览器忽略）
 
 ### 零配置自动化
 
@@ -63,7 +62,7 @@ SIGINT/SIGTERM 优雅排空。
 - **inotify 热更新** — 修改 `aimail_routes.toml` 即时生效
 - **ACME 自动 TLS** — 设置 `hostname` → 自动 Let's Encrypt 证书（HTTP-01 挑战），
   缓存复用，每 ~60 天自动续期
-- **双端口模式** — `addr` 端口 80 + `hostname` 已设 → 自动 80→443 重定向
+- **双端口模式** — `bind` 端口 80 + `hostname` 已设 → 自动 80→443 重定向
 - **守护模式** — `--daemon` 双 fork，PID 文件、日志文件，无需看管
 
 ---
@@ -86,7 +85,7 @@ gateway ──POST──►      │                                  │
 - gateway 发到 bridge 的**单一端口**，bridge 按 agent 邮箱自动路由
 - 同一封邮件多个收件人 → gateway 只传**一份 body**（批量聚合）
 - TLS 由 rustls 提供；设 `hostname` 即可启用 ACME 自动证书
-- 双端口：`addr = "0.0.0.0:80"` + `hostname` → 自动 80→443
+- 双端口：`bind = "0.0.0.0:80"` + `hostname` → 自动 80→443
 - 实时性：gateway 通过 bridge 即时获取 agent HTTP 响应
 
 ### Pull — 零端口，穿透 NAT 入站
@@ -94,7 +93,7 @@ gateway ──POST──►      │                                  │
 ```
 gateway (公网)                              NAT/防火墙内
   │                                          │
-  │◄── POST /pending (poll 每 10s) ──────────│ bridge (出站，无需开放端口)
+  │◄── POST /api/v1/admin/pending (poll 每 10s) ──────────│ bridge (出站，无需开放端口)
   │                                          │
   │── batches [{body, deliveries}] ─────────►│
   │                                          │
@@ -102,11 +101,11 @@ gateway (公网)                              NAT/防火墙内
   │                            │ fan-out 到各 agent webhook      │
   │                            │ ACK 已转发的 delivery           │
   │                            └───────────────────────────────┘
-  │◄── POST /pending/ack ───────────────────│
+  │◄── POST /api/v1/admin/pending/ack ───────────────────│
 ```
 
 - 只需要**一条出站 HTTP 连接**到 gateway，完全穿透 NAT/防火墙
-- **零监听 socket**——不开放任何端口，不接收任何入站流量
+- **无公网端口**——仅本机 admin API，不接收任何入站流量
 - 同样支持批量聚合：body 序列化一次，所有收件人复用
 - ACK 消费 + 2 小时去重缓存，不丢消息、不重复投递
 - 拉取失败指数退避重启（最大 5 分钟）
@@ -123,18 +122,28 @@ cargo build --release
 # Push 模式（一个端口，所有 agent）
 cat > aimail_bridge.toml << 'EOF'
 mode = "push"
-[push]
-addr = "0.0.0.0:38080"
+bind = "0.0.0.0:38080"
 hostname = "bridge.example.com"     # 启用 TLS + ACME 自动证书
+admin_allowed_ips = ["127.0.0.1", "::1"]
+
+[logging]
+level = "info"       # 输出到 stdout（不写 [logging] 时默认写 /var/log/aimail-bridge.log，非 root 会失败）
+
+[push]
 allowed_ips = ["10.0.0.0/8"]
 EOF
 
 # Pull 模式（零端口，纯出站）
 cat > aimail_bridge.toml << 'EOF'
 mode = "pull"
+bind = "127.0.0.1:38080"
+
+[logging]
+level = "info"       # 输出到 stdout（不写 [logging] 时默认写 /var/log/aimail-bridge.log，非 root 会失败）
+
 [pull]
 aimail_url = "http://gateway.example.com:38080"
-admin_key = "sk-xxxxxxxx"
+admin_key = "sk-xxxxxxxx"           # system 级 key（pending 按该 key 所属 system 过滤）
 system_id = "admin"
 EOF
 
@@ -146,7 +155,7 @@ EOF
 
 # 检查健康状态
 curl http://localhost:38080/health
-# {"status":"ok","uptime_secs":42,"version":"0.3.0"}
+# {"status":"ok","uptime_secs":42,"version":"0.7.2"}
 ```
 
 ---
@@ -158,12 +167,20 @@ curl http://localhost:38080/health
 ```toml
 mode = "push"
 
-[push]
-addr = "0.0.0.0:38080"                # 监听地址（默认："0.0.0.0:38080"）
-hostname = "bridge.example.com"       # 启用 TLS + ACME 自动证书
+bind = "0.0.0.0:38080"                # 监听地址（默认："0.0.0.0:38080"）
+hostname = "bridge.example.com"       # 公网域名 — 启用 TLS（见下）
+admin_allowed_ips = ["127.0.0.1", "::1"]   # admin API 白名单（默认：仅本机）
+
+# TLS 三种方式，任选其一
+# 1) 只设 hostname          → ACME 自动证书（Let's Encrypt HTTP-01）
+# 2) hostname + 静态证书    → 用下面的 tls_cert / tls_key
+# 3) 不设 hostname / hostname 为 IP → 纯 HTTP
 # tls_cert = "/etc/ssl/bridge.crt"   # 静态 TLS 证书（可选）
 # tls_key  = "/etc/ssl/bridge.key"   # 静态 TLS 私钥（可选）
-# acme_cache = "./acme_cache"        # ACME 缓存目录（默认：./acme_cache）
+# acme_email = "admin@example.com"   # ACME 联系邮箱（可选）
+# acme_cache = "~/.acme_cache"       # ACME 缓存目录（默认：~/.acme_cache）
+
+[push]
 blacklist_ips = ["1.2.3.4"]          # 永久封禁 IP（默认：[]）
 allowed_ips = ["10.0.0.0/8"]         # IP 白名单，空 = 全部放行（默认：[]）
 rate_limit = 30                       # 每源 IP req/sec，0 = 禁用（默认：30）
@@ -175,9 +192,11 @@ body_limit_mb = 20                    # 请求体最大 MB（默认：20）
 ```toml
 mode = "pull"
 
+bind = "127.0.0.1:38080"              # 监听地址（仅 admin API）
+
 [pull]
 aimail_url = "http://gateway.example.com:38080"
-admin_key = "sk-xxxxxxxx"            # gateway 的 system admin API key
+admin_key = "sk-xxxxxxxx"            # system 级 key — 须与 pending 所属 system 一致
 system_id = "admin"                  # pending 查询用的系统 ID（默认："admin"）
 poll_interval_sec = 10               # 轮询间隔秒（默认：10）
 ```
@@ -197,14 +216,15 @@ file = "/var/log/aimail-bridge.log"   # 日志文件路径，不设则 stdout
 | 变量 | 对应配置 |
 |---|---|
 | `AIMAIL_BRIDGE_MODE` | `mode` |
-| `AIMAIL_BRIDGE_HOSTNAME` | `push.hostname` |
+| `AIMAIL_BRIDGE_HOSTNAME` | `hostname`（顶层） |
 | `AIMAIL_GATEWAY_URL` | `pull.aimail_url` |
 | `AIMAIL_BRIDGE_ADMIN_KEY` | `pull.admin_key` |
 | `AIMAIL_BRIDGE_SYSTEM_ID` | `pull.system_id` |
 | `AIMAIL_BRIDGE_POLL_SECS` | `pull.poll_interval_sec` |
 | `AIMAIL_BRIDGE_ALLOWED_IPS` | `push.allowed_ips`（逗号分隔） |
-| `HERMES_HOME` | Hermes 根目录（默认 `~/.hermes`） |
 | `RUST_LOG` | tracing 过滤器（覆盖 `logging.level`） |
+
+hermes_home（配置字段，默认 `~/.hermes`）
 
 ---
 
@@ -213,7 +233,7 @@ file = "/var/log/aimail-bridge.log"   # 日志文件路径，不设则 stdout
 设置 `hostname` 即可自动启用 Let's Encrypt TLS（HTTP-01 挑战）。
 证书自动缓存续期，端口 80 需公网可达。
 
-**双端口模式：** `addr` 为 80 + `hostname` 已设时，80 处理 ACME 验证 +
+**双端口模式：** `bind` 为 80 + `hostname` 已设时，80 处理 ACME 验证 +
 重定向到 443，443 处理 HTTPS 应用。
 
 ---

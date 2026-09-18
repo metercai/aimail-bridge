@@ -1,12 +1,11 @@
 # aimail-bridge configuration 
 #
 # Copy this file to aimail_bridge.toml and edit to match your setup.
-# hostname = "bridge.internal"         # public address (defaults to addr)
 
 # mode = "push"  # "push" or "pull" (default: "push")
 
 bind = "0.0.0.0:38080"           # Listen address for admin API + push webhooks
-# hostname = "bridge.internal"         # public address (defaults to addr)
+# hostname = "bridge.internal"         # public domain/IP announced to the gateway (domain → TLS)
 admin_allowed_ips = ["127.0.0.1", "::1"]   # Admin API IP whitelist
 
 # Logging

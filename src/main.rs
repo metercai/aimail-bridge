@@ -350,7 +350,12 @@ async fn async_main(
         // (sequentially awaiting infinite loops would starve all but the first).
         let first_err = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let mut pull_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for sys in config.pull.resolved_systems() {
+        let pull_systems = config.pull.resolved_systems();
+        if pull_systems.is_empty() {
+            // 未配置 pull 目标(等新对接填入)是合法状态: 不起循环, 也不报错。
+            tracing::info!("no pull targets configured — pull loops disabled");
+        }
+        for sys in pull_systems {
             let r = router.clone();
             let sd = shutdown.clone();
             let fe = first_err.clone();

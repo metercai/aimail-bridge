@@ -233,9 +233,22 @@ impl PullConfig {
     /// Resolve the list of pull systems: explicit `systems` array when
     /// non-empty, otherwise a single synthesized entry from the flat fields
     /// (legacy single-system config compatibility).
+    ///
+    /// Only entries that can actually be polled (URL + system_id present) are
+    /// returned: a config may legitimately carry no pull target yet, and a
+    /// blank target must not become a loop that fails on every interval.
     pub fn resolved_systems(&self) -> Vec<PullSystemConfig> {
-        if !self.systems.is_empty() {
-            return self.systems.clone();
+        let configured: Vec<PullSystemConfig> = self
+            .systems
+            .iter()
+            .filter(|s| !s.aimail_url.trim().is_empty() && !s.system_id.trim().is_empty())
+            .cloned()
+            .collect();
+        if !configured.is_empty() {
+            return configured;
+        }
+        if self.aimail_url.trim().is_empty() || self.system_id.trim().is_empty() {
+            return Vec::new();
         }
         vec![PullSystemConfig {
             aimail_url: self.aimail_url.clone(),
@@ -570,6 +583,35 @@ systems = [
                    "scheme-less entry gets http:// prefix");
         assert_eq!(systems[1].aimail_url, "https://b.tm",
                    "entry with explicit scheme untouched");
+    }
+
+    #[test]
+    fn test_pull_blank_entries_are_not_pull_targets() {
+        // 半填/空条目不得变成 poll 目标: 只有 URL + system_id 齐备才算配置了。
+        let cfg: BridgeConfig = toml::from_str(r#"
+mode = "pull"
+[pull]
+systems = [
+    { aimail_url = "", admin_key = "", system_id = "" },
+    { aimail_url = "https://a.tm", admin_key = "ka", system_id = "sys-a" },
+]
+"#).unwrap();
+        let systems = cfg.pull.resolved_systems();
+        assert_eq!(systems.len(), 1, "blank entry filtered out");
+        assert_eq!(systems[0].system_id, "sys-a");
+    }
+
+    #[test]
+    fn test_pull_no_targets_configured_is_clean() {
+        // 未配置任何 pull 目标(等新对接填入)是合法状态: 不得合成一个空目标,
+        // 否则 pull 循环会每轮报错(2026-09-18 清库后本地桥 401 续发的根因治理)。
+        let cfg: BridgeConfig = toml::from_str(r#"
+mode = "pull"
+[pull]
+systems = []
+"#).unwrap();
+        assert!(cfg.pull.resolved_systems().is_empty(),
+                "no pull targets → empty list, no synthetic blank entry");
     }
 
     #[test]

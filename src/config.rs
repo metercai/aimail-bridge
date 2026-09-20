@@ -5,8 +5,21 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Full bridge configuration, deserialised from `aimail_bridge.toml`.
+/// 配置 schema 的最高受支持版本(契约, 2026-09-20)。
+/// 桥只接受 `schema_version <= SUPPORTED_SCHEMA_VERSION`; 更高版本拒绝启动,
+/// 避免"旧桥跑新语义配置"这种静默错配(CLI 写配置时应写入当前版本)。
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeConfig {
+    /// 配置 schema 版本。缺省=1(历史配置一律视为 v1, 向后兼容)。
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
     #[serde(default = "default_mode")]
     pub mode: String, // "push" | "pull"
 
@@ -341,6 +354,16 @@ impl BridgeConfig {
             toml::from_str(&content)?
         };
 
+        // schema 版本契约: 更高版本 = 用旧桥跑新配置 ⇒ 明确拒绝(不猜语义)
+        if cfg.schema_version > SUPPORTED_SCHEMA_VERSION {
+            return Err(format!(
+                "config schema_version={} is newer than this bridge supports ({}); \
+                 upgrade aimail-bridge before using this config",
+                cfg.schema_version, SUPPORTED_SCHEMA_VERSION
+            )
+            .into());
+        }
+
         // Env overrides
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_MODE") { cfg.mode = v; }
         if let Ok(v) = std::env::var("AIMAIL_BRIDGE_HOSTNAME") {
@@ -409,6 +432,31 @@ impl BridgeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_version_defaults_to_v1_and_newer_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("br-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 缺省 schema_version ⇒ 视为 v1
+        let p1 = dir.join("a.toml");
+        std::fs::write(&p1, "mode = \"push\"\n").unwrap();
+        let c1 = BridgeConfig::load(Some(&p1)).expect("v1 配置应可加载");
+        assert_eq!(c1.schema_version, 1);
+
+        // 未知键必须被容忍(前向兼容: CLI 可先写新键)
+        let p2 = dir.join("b.toml");
+        std::fs::write(&p2, "mode = \"push\"\nfuture_key = 42\n").unwrap();
+        assert!(BridgeConfig::load(Some(&p2)).is_ok(), "未知键不应导致失败");
+
+        // 更高版本 ⇒ 拒绝
+        let p3 = dir.join("c.toml");
+        std::fs::write(&p3, format!("schema_version = {}\n", SUPPORTED_SCHEMA_VERSION + 1)).unwrap();
+        let e = BridgeConfig::load(Some(&p3)).unwrap_err().to_string();
+        assert!(e.contains("newer than this bridge supports"), "错误信息应说明版本过高: {e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_defaults() {

@@ -69,6 +69,21 @@ Works for both push and pull modes.
 - **Dual-port mode** — `bind` port 80 + `hostname` set → auto 80→443 redirect
 - **Daemon mode** — `--daemon` double-fork, PID file, log file, zero supervision
 
+### Platform support
+
+| | start | stop |
+|---|---|---|
+| Linux / macOS | `--daemon` — double-fork, detached, PID file + log file | `--stop` — SIGTERM, escalated to SIGKILL after 10 s |
+| Windows | `--daemon` — detached child process, no console window | `--stop` — `taskkill`, escalated to `taskkill /F` |
+
+The lifecycle contract is identical on every platform: `--status [--json]`
+(0 running · 3 not running), `--stop` (0 stopped or not running · 1 refused),
+`--check-config` (0 valid · 2 invalid). A PID read from the PID file is acted on
+only after its executable name is verified to be `aimail-bridge`, so a recycled
+PID is never killed. Registering the bridge as a service or scheduled task is
+out of scope — use the platform's own service manager (systemd, launchd,
+`sc.exe`, Task Scheduler).
+
 ---
 
 ## Two modes

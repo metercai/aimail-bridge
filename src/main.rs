@@ -181,8 +181,12 @@ pub fn daemonize(_pid_file: &PathBuf, _log_file: &PathBuf) {
 /// Windows daemonize: spawn a detached child process (no console window),
 /// then exit the parent.  The child detects it is already detached and
 /// continues normally — equivalent to Unix double-fork semantics.
+///
+/// 平台注意：Windows 没有 SIGTERM/双 fork。`--stop` 走 taskkill（无 /F 无法终止
+/// 控制台程序时会升级为 /F）。"注册为服务/计划任务"**不在桥内做** —— 用系统自带
+/// 服务管理器（见 README 的平台说明）。
 #[cfg(windows)]
-pub fn daemonize(pid_file: &PathBuf, log_file: &PathBuf) {
+pub fn daemonize(pid_file: &PathBuf, _log_file: &PathBuf) {
     extern "system" {
         fn GetConsoleWindow() -> isize;
     }
@@ -194,15 +198,11 @@ pub fn daemonize(pid_file: &PathBuf, log_file: &PathBuf) {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(pid_file, process::id().to_string().as_bytes());
-        // Redirect stdio to log file
-        if let Ok(log) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-        {
-            let _ = log; // keep alive
-                         // On Windows, the parent already nulled our stdio handles;
-                         // tracing output goes to the tokio runtime's writer.
+        // stdio 无需在此重定向：父进程已用 DETACHED_PROCESS + Stdio::null() 把子进程的
+        // stdin/stdout/stderr 置空；日志由 init_tracing(daemon=true, log_file) 直接写文件。
+        // （此处曾 OpenOptions 打开 log 又立刻 `let _ = log;` drop 句柄 —— 无效且误导, 已删。）
+        if let Some(parent) = _log_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
         return;
     }

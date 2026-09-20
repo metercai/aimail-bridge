@@ -41,16 +41,54 @@ pub fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// 按 CSV 引号规则切分一行（纯函数 —— 供非 linux 路径在**任意平台**单测）。
+/// tasklist 的 `--FO CSV` 里内存列含逗号（`"12,345 K"`），朴素 split(',') 会错位。
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// 解析 `tasklist /FO CSV /NH` 的首行 → (pid, 可执行名)。
+/// 纯函数：把 Windows 侧解析逻辑搬到能被本机测试覆盖的位置。
+/// 无匹配时 tasklist 输出 `INFO: No tasks are running …`（无引号）⇒ None。
+#[cfg_attr(unix, allow(dead_code))] // 仅非 unix 路径调用，但测试在所有平台跑
+pub fn parse_tasklist_row(out: &str) -> Option<(i32, String)> {
+    let line = out.lines().next()?.trim_end();
+    if !line.starts_with('"') {
+        return None;
+    }
+    let fields = csv_fields(line);
+    let name = fields.first()?.trim().to_string();
+    let pid: i32 = fields.get(1)?.trim().parse().ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((pid, name))
+}
+
 #[cfg(not(unix))]
 pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    let out = Command::new("tasklist")
+    match Command::new("tasklist")
         .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        .output()
+    {
+        // 精确比较 pid 字段（原实现用 substring，pid 1234 会被 12345 命中 ⇒ 假存活）
+        Ok(o) => parse_tasklist_row(&String::from_utf8_lossy(&o.stdout))
+            .map(|(p, _)| p == pid)
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
@@ -85,13 +123,18 @@ fn proc_exe_name(pid: i32) -> Option<String> {
         .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
         .output()
         .ok()?;
-    let line = String::from_utf8_lossy(&o.stdout);
-    // CSV: "name.exe","1234",...
-    let first = line.split(',').next()?.trim().trim_matches('"').to_string();
-    if first.is_empty() {
+    // tasklist 报告的是 "aimail-bridge.exe" ⇒ 必须经 exe_basename 去 .exe 并小写,
+    // 否则 is_bridge 拿带后缀的名字比 "aimail-bridge" **恒不相等** ⇒ Windows 上
+    // --status 会把在跑的桥报成 pid-not-bridge、--stop 直接拒绝(契约形同失效)。
+    let (row_pid, name) = parse_tasklist_row(&String::from_utf8_lossy(&o.stdout))?;
+    if row_pid != pid {
+        return None;
+    }
+    let base = exe_basename(&name);
+    if base.is_empty() {
         None
     } else {
-        Some(first)
+        Some(base)
     }
 }
 
@@ -394,5 +437,47 @@ mod tests {
             "拒绝时不得删除 pid 文件"
         );
         std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn tasklist_row_parsing_is_exact() {
+        // 真实形态：内存列含逗号（引号内）不得导致字段错位
+        let row = "\"aimail-bridge.exe\",\"1234\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        assert_eq!(
+            parse_tasklist_row(row),
+            Some((1234, "aimail-bridge.exe".to_string()))
+        );
+        // 无匹配时 tasklist 输出 INFO 行（无引号）⇒ 不得当成存活
+        assert_eq!(
+            parse_tasklist_row(
+                "INFO: No tasks are running which match the specified criteria.\r\n"
+            ),
+            None
+        );
+        assert_eq!(parse_tasklist_row(""), None);
+        assert_eq!(parse_tasklist_row("\"name.exe\",\"not-a-pid\"\r\n"), None);
+    }
+
+    /// Windows 身份判定契约（纯逻辑，本机可跑）：tasklist 报 "aimail-bridge.exe"
+    /// 必须判为桥（去 .exe + 小写）；别的程序不得判为桥（防误杀）。
+    #[test]
+    fn windows_identity_contract_uses_basename() {
+        let row = "\"aimail-bridge.exe\",\"4242\",\"Console\",\"1\",\"9,000 K\"\r\n";
+        let (pid, name) = parse_tasklist_row(row).unwrap();
+        assert_eq!(pid, 4242);
+        assert_eq!(exe_basename(&name), BRIDGE_BIN);
+
+        let other = "\"aimail-bridge-helper.exe\",\"4243\",\"Console\",\"1\",\"9,000 K\"\r\n";
+        let (_, other_name) = parse_tasklist_row(other).unwrap();
+        assert_ne!(exe_basename(&other_name), BRIDGE_BIN);
+    }
+
+    /// pid 必须精确比较：原实现用 substring，pid 1234 会被 "12345" 命中（假存活）。
+    #[test]
+    fn pid_match_is_exact_not_substring() {
+        let row = "\"aimail-bridge.exe\",\"12345\",\"Console\",\"1\",\"1 K\"\r\n";
+        let (parsed, _) = parse_tasklist_row(row).unwrap();
+        assert_eq!(parsed, 12345);
+        assert_ne!(parsed, 1234);
     }
 }

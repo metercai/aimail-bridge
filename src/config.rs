@@ -343,12 +343,36 @@ impl Default for PullConfig {
     }
 }
 
+/// 未给 `--config` 时的默认配置路径(纯函数, 便于单测)：
+/// ① 优先 CLI 布局 `~/.aimail/bridge/aimail_bridge.toml`(存在则取 —— 与 pid/log
+///    默认同目录, CLI/repair 写的就是这份)；
+/// ② 否则退回 `./aimail_bridge.toml`(历史 CWD 相对行为, 不破坏既有用法)。
+fn default_config_path_in(home: &std::path::Path) -> PathBuf {
+    let cli_layout = home
+        .join(".aimail")
+        .join("bridge")
+        .join("aimail_bridge.toml");
+    if cli_layout.is_file() {
+        return cli_layout;
+    }
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("aimail_bridge.toml")
+}
+
 impl BridgeConfig {
+    /// 默认配置路径：优先 CLI 布局 `~/.aimail/bridge/aimail_bridge.toml`（存在则取，
+    /// 与 pid/log 默认同目录），否则 `./aimail_bridge.toml`。见 `default_config_path_in`。
+    pub fn default_config_path() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        default_config_path_in(&home)
+    }
+
     /// Load config from a TOML file, then apply environment variable overrides.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = path
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("aimail_bridge.toml"));
+            .unwrap_or_else(Self::default_config_path);
         let mut cfg: BridgeConfig = {
             let content = std::fs::read_to_string(&config_path)?;
             toml::from_str(&content)?
@@ -690,5 +714,26 @@ systems = [
 "#).unwrap();
         let systems = cfg.pull.resolved_systems();
         assert_eq!(systems[0].effective_key(), "ak", "api_key preferred over admin_key");
+    }
+
+    #[test]
+    fn default_config_path_prefers_cli_layout() {
+        // ① CLI 布局存在 ⇒ 用它（与 pid/log 默认同目录；CLI/repair 写的就是这份）
+        let home = std::env::temp_dir().join(format!("br-cfgpath-{}", std::process::id()));
+        let bridge_dir = home.join(".aimail").join("bridge");
+        std::fs::create_dir_all(&bridge_dir).unwrap();
+        let cli_cfg = bridge_dir.join("aimail_bridge.toml");
+        std::fs::write(&cli_cfg, "mode = \"push\"\n").unwrap();
+        assert_eq!(default_config_path_in(&home), cli_cfg);
+        // ② 不存在 ⇒ 退回 CWD 相对（历史行为，不破坏既有用法）
+        std::fs::remove_file(&cli_cfg).unwrap();
+        let fallback = default_config_path_in(&home);
+        assert!(fallback.ends_with("aimail_bridge.toml"));
+        assert_eq!(
+            fallback.parent().unwrap(),
+            std::env::current_dir().unwrap(),
+            "fallback must stay CWD-relative"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

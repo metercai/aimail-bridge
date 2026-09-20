@@ -14,15 +14,15 @@
 //! the log file (default: ~/.hermes/aimail-bridge.log), and writes a PID file
 //! (default: ~/.hermes/aimail-bridge.pid).
 
+mod acme;
+mod admin;
 mod config;
+mod health;
 mod pull;
 mod push;
 mod router;
-mod acme;
-mod vhost;
 mod security;
-mod admin;
-mod health;
+mod vhost;
 
 use std::path::PathBuf;
 use std::process;
@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 use crate::config::BridgeConfig;
 
+mod lifecycle;
+
 /// CLI args parsed before daemonize (no async / tokio dependency).
 #[derive(Default)]
 pub struct CliArgs {
@@ -38,6 +40,11 @@ pub struct CliArgs {
     pub pid_file: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
+    // 一次性生命周期操作（P1-α：status/stop/check-config，不进 tokio、不 daemonize）
+    pub status: bool,
+    pub stop: bool,
+    pub check_config: bool,
+    pub json: bool,
 }
 
 pub fn parse_args() -> CliArgs {
@@ -47,18 +54,44 @@ pub fn parse_args() -> CliArgs {
     while i < args.len() {
         match args[i].as_str() {
             "--daemon" | "-d" => cli.daemon = true,
-            "--pid-file" => { i += 1; cli.pid_file = Some(PathBuf::from(&args[i])); }
-            "--log-file" => { i += 1; cli.log_file = Some(PathBuf::from(&args[i])); }
-            "--config" | "-c" => { i += 1; cli.config_path = Some(PathBuf::from(&args[i])); }
+            "--pid-file" => {
+                i += 1;
+                cli.pid_file = Some(PathBuf::from(&args[i]));
+            }
+            "--log-file" => {
+                i += 1;
+                cli.log_file = Some(PathBuf::from(&args[i]));
+            }
+            "--config" | "-c" => {
+                i += 1;
+                cli.config_path = Some(PathBuf::from(&args[i]));
+            }
+            "--status" => cli.status = true,
+            "--stop" => cli.stop = true,
+            "--check-config" => cli.check_config = true,
+            "--json" => cli.json = true,
             "--help" | "-h" => {
                 println!("aimail-bridge — transparent relay-gateway bridge\n");
                 println!("Usage: aimail-bridge [OPTIONS]\n");
                 println!("Options:");
                 println!("  -d, --daemon       Detach from terminal, run in background");
-                println!("  --pid-file <path>  PID file path (default: ~/.hermes/aimail-bridge.pid)");
-                println!("  --log-file <path>  Log file path (default: ~/.hermes/aimail-bridge.log)");
+                println!(
+                    "  --pid-file <path>  PID file path (default: ~/.aimail/bridge/bridge.pid)"
+                );
+                println!(
+                    "  --log-file <path>  Log file path (default: ~/.aimail/bridge/bridge.log)"
+                );
                 println!("  -c, --config <path> Config file path (default: ./aimail_bridge.toml)");
-                println!("  -h, --help         Show this help");
+                println!("  --status           Report whether the bridge is running (read-only)");
+                println!(
+                    "  --stop             Gracefully stop a running bridge (refuses foreign PIDs)"
+                );
+                println!("  --check-config     Validate the config only, do not start");
+                println!("  --json             Machine-readable output for the above");
+                println!("  -h, --help         Show this help\n");
+                println!(
+                    "Exit codes: 0 ok/running · 1 error/refused · 2 bad config · 3 not running"
+                );
                 process::exit(0);
             }
             other => {
@@ -82,29 +115,41 @@ pub fn daemonize(pid_file: &PathBuf, log_file: &PathBuf) {
 
     // First fork
     match unsafe { libc::fork() } {
-        -1 => { eprintln!("fork failed"); process::exit(1); }
-        0  => {} // child continues
-        _   => process::exit(0), // parent exits
+        -1 => {
+            eprintln!("fork failed");
+            process::exit(1);
+        }
+        0 => {}                // child continues
+        _ => process::exit(0), // parent exits
     }
 
     // New session — detach from terminal
     if unsafe { libc::setsid() } == -1 {
-        eprintln!("setsid failed"); process::exit(1);
+        eprintln!("setsid failed");
+        process::exit(1);
     }
 
     // Second fork — no longer session leader, can't reacquire terminal
     match unsafe { libc::fork() } {
-        -1 => { eprintln!("second fork failed"); process::exit(1); }
-        0  => {} // grandchild continues
-        _   => process::exit(0),
+        -1 => {
+            eprintln!("second fork failed");
+            process::exit(1);
+        }
+        0 => {} // grandchild continues
+        _ => process::exit(0),
     }
 
     // Redirect stdio to log file
     let log = match std::fs::OpenOptions::new()
-        .create(true).append(true).open(log_file)
+        .create(true)
+        .append(true)
+        .open(log_file)
     {
         Ok(f) => f,
-        Err(e) => { eprintln!("Cannot open log file {:?}: {}", log_file, e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Cannot open log file {:?}: {}", log_file, e);
+            process::exit(1);
+        }
     };
     use std::os::unix::io::AsRawFd;
     let log_fd = log.as_raw_fd();
@@ -151,11 +196,13 @@ pub fn daemonize(pid_file: &PathBuf, log_file: &PathBuf) {
         let _ = std::fs::write(pid_file, process::id().to_string().as_bytes());
         // Redirect stdio to log file
         if let Ok(log) = std::fs::OpenOptions::new()
-            .create(true).append(true).open(log_file)
+            .create(true)
+            .append(true)
+            .open(log_file)
         {
             let _ = log; // keep alive
-            // On Windows, the parent already nulled our stdio handles;
-            // tracing output goes to the tokio runtime's writer.
+                         // On Windows, the parent already nulled our stdio handles;
+                         // tracing output goes to the tokio runtime's writer.
         }
         return;
     }
@@ -187,12 +234,24 @@ pub fn daemonize(pid_file: &PathBuf, log_file: &PathBuf) {
 pub fn main() {
     let cli = parse_args();
 
+    // 一次性生命周期操作：不进 tokio 运行时、不 daemonize
+    if cli.status || cli.stop || cli.check_config {
+        let (def_pid, _def_log) = lifecycle::default_paths();
+        let pid_file = cli.pid_file.clone().unwrap_or(def_pid);
+        let code = if cli.status {
+            lifecycle::status(&pid_file, cli.json)
+        } else if cli.stop {
+            lifecycle::stop(&pid_file, cli.json)
+        } else {
+            lifecycle::check_config(cli.config_path.as_deref(), cli.json)
+        };
+        std::process::exit(code);
+    }
+
     // Resolve default paths (no tokio needed)
-    let hermes_home = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".hermes");
-    let pid_file = cli.pid_file.clone().unwrap_or_else(|| hermes_home.join("aimail-bridge.pid"));
-    let log_file = cli.log_file.clone().unwrap_or_else(|| hermes_home.join("aimail-bridge.log"));
+    let (def_pid, def_log) = lifecycle::default_paths();
+    let pid_file = cli.pid_file.clone().unwrap_or(def_pid);
+    let log_file = cli.log_file.clone().unwrap_or(def_log);
 
     // Daemonize before any tokio runtime exists
     if cli.daemon {
@@ -237,9 +296,7 @@ async fn async_main(
     tracing::info!("aimail-bridge starting (pid={})", process::id());
 
     config.validate();
-    let router = Arc::new(router::ProfileRouter::new(
-        config.routes_file.clone(),
-    ));
+    let router = Arc::new(router::ProfileRouter::new(config.routes_file.clone()));
     router.load_from_file();
 
     if let Err(e) = router::start_routes_watcher(router.clone()) {
@@ -281,9 +338,11 @@ async fn async_main(
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             config: config.clone(),
-            forward_headers: config.forward_headers.iter().filter_map(|h| {
-                axum::http::HeaderName::from_bytes(h.as_bytes()).ok()
-            }).collect(),
+            forward_headers: config
+                .forward_headers
+                .iter()
+                .filter_map(|h| axum::http::HeaderName::from_bytes(h.as_bytes()).ok())
+                .collect(),
         };
         let push_router = push::build_push_router(push_state);
         admin_router.merge(push_router)
@@ -423,14 +482,19 @@ async fn acme_tls_config(
             .join(".acme_cache"),
     };
 
-    let challenge_path = config.acme_challenge_path.as_deref().and_then(|p| p.to_str());
+    let challenge_path = config
+        .acme_challenge_path
+        .as_deref()
+        .and_then(|p| p.to_str());
     let email = config.acme_email.as_deref();
 
     // Pre-flight: if a challenge_path is configured it must be writable,
     // otherwise the HTTP-01 flow would fail mid-order (challenge written
     // only at set_ready time). Fail fast here instead (AUDIT-2).
     if let Some(dir) = challenge_path {
-        let well_known = std::path::Path::new(dir).join(".well-known").join("acme-challenge");
+        let well_known = std::path::Path::new(dir)
+            .join(".well-known")
+            .join("acme-challenge");
         std::fs::create_dir_all(&well_known)?;
         let probe = well_known.join(".acme_probe");
         std::fs::write(&probe, b"1")?;
@@ -513,8 +577,7 @@ async fn start_https(
 fn init_tracing(cfg: &crate::config::LoggingConfig, daemon: bool, daemon_log: &std::path::Path) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.level));
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -523,7 +586,9 @@ fn init_tracing(cfg: &crate::config::LoggingConfig, daemon: bool, daemon_log: &s
     // Determine log destination: daemon log file > config log file > stdout
     let writer: Box<dyn std::io::Write + Send> = if daemon {
         let file = std::fs::OpenOptions::new()
-            .create(true).append(true).open(daemon_log)
+            .create(true)
+            .append(true)
+            .open(daemon_log)
             .unwrap_or_else(|e| panic!("failed to open daemon log file {:?}: {}", daemon_log, e));
         Box::new(file)
     } else if let Some(ref path) = cfg.file {
@@ -531,7 +596,9 @@ fn init_tracing(cfg: &crate::config::LoggingConfig, daemon: bool, daemon_log: &s
             let _ = std::fs::create_dir_all(parent);
         }
         let file = std::fs::OpenOptions::new()
-            .create(true).append(true).open(path)
+            .create(true)
+            .append(true)
+            .open(path)
             .unwrap_or_else(|e| panic!("failed to open log file {:?}: {}", path, e));
         Box::new(file)
     } else {
@@ -564,11 +631,7 @@ mod cli_tests {
 
     #[test]
     fn test_parse_args_config() {
-        let cli = parse_args_from(&[
-            "aimail-bridge".into(),
-            "-c".into(),
-            "/tmp/test.toml".into(),
-        ]);
+        let cli = parse_args_from(&["aimail-bridge".into(), "-c".into(), "/tmp/test.toml".into()]);
         assert_eq!(cli.config_path, Some(PathBuf::from("/tmp/test.toml")));
     }
 
@@ -600,13 +663,21 @@ pub fn parse_args_from(args: &[String]) -> CliArgs {
     while i < args.len() {
         match args[i].as_str() {
             "--daemon" | "-d" => cli.daemon = true,
-            "--pid-file" => { i += 1; cli.pid_file = Some(PathBuf::from(&args[i])); }
-            "--log-file" => { i += 1; cli.log_file = Some(PathBuf::from(&args[i])); }
-            "--config" | "-c" => { i += 1; cli.config_path = Some(PathBuf::from(&args[i])); }
+            "--pid-file" => {
+                i += 1;
+                cli.pid_file = Some(PathBuf::from(&args[i]));
+            }
+            "--log-file" => {
+                i += 1;
+                cli.log_file = Some(PathBuf::from(&args[i]));
+            }
+            "--config" | "-c" => {
+                i += 1;
+                cli.config_path = Some(PathBuf::from(&args[i]));
+            }
             _ => {}
         }
         i += 1;
     }
     cli
 }
-

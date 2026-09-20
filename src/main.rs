@@ -265,15 +265,25 @@ pub fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
-        let result = async_main(cli, pid_file, log_file).await;
-        // NOTE: pid file is intentionally NOT removed on exit (AUDIT-1 A4).
-        // deploy_bridge's start_bridge kills stale processes via the pid file
-        // before starting a new instance; deleting it here makes that fail
-        // after a crash/restart (double-instance risk). The next start
-        // overwrites it.
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Fatal error");
-            std::process::exit(1);
+        let result = async_main(cli, pid_file.clone(), log_file).await;
+        // pid 文件归属(2026-09-20, 取代 AUDIT-1 A4):
+        //   A4 当年"退出不删 pid"的理由是 —— deploy_bridge.start_bridge 靠 pid 文件在启动前
+        //   杀陈旧进程, 删掉会让崩溃/重启后杀不掉(双实例风险)。
+        //   桥现在自带 --status/--stop 且做 **PID 身份校验**, 陈旧 pid 改由"识别"而非"盲杀"处理;
+        //   CLI 侧(P2, cli 11e866e)也已不再自行 kill 进程 ⇒ A4 的理由消失。
+        //   新规则: **正常退出删除**(干净) · **异常/崩溃退出保留**(供 --status 报 stale-pid, 便于诊断)。
+        match result {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(&pid_file) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, "failed to remove pid file on shutdown");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Fatal error");
+                std::process::exit(1);
+            }
         }
     });
 }

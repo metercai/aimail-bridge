@@ -40,7 +40,11 @@ pub fn build_admin_router(config: &BridgeConfig, router: Arc<ProfileRouter>) -> 
     let admin_routes = Router::new()
         .route("/health", get(health))
         .route("/api/v1/routes", get(list_routes).post(create_route))
-        .route("/api/v1/routes/{email}", delete(delete_route));
+        // 注意: axum 0.7 的路径参数语法是 `:name`，`{name}` 是 0.8 才引入的。
+        // 曾误用 `{email}`(见 v0.7.4) ⇒ matchit 0.7 把该段当**字面量**，DELETE 真地址
+        // 恒为 404、handler 永不执行(2026-09-21 实测: 桥日志无 "Route deleted via API"
+        // 且路由纹丝不动)，运维无法用 API 摘除陈旧路由。
+        .route("/api/v1/routes/:email", delete(delete_route));
 
     // IP whitelist middleware for admin endpoints
     if !allowed.is_empty() {

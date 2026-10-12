@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,13 @@ pub fn build_admin_router(config: &BridgeConfig, router: Arc<ProfileRouter>) -> 
         // 曾误用 `{email}`(见 v0.7.4) ⇒ matchit 0.7 把该段当**字面量**，DELETE 真地址
         // 恒为 404、handler 永不执行(2026-09-21 实测: 桥日志无 "Route deleted via API"
         // 且路由纹丝不动)，运维无法用 API 摘除陈旧路由。
-        .route("/api/v1/routes/:email", delete(delete_route));
+        .route("/api/v1/routes/:email", delete(delete_route))
+        .route("/api/v1/probe", post(probe));
+
+    // On-demand reachability probe (2026-10-13): the CLI's install webhook
+    // plan uses it for the second hop (bridge → agent inbound target). The
+    // endpoint is inside the same `admin_routes` router, so it is covered by
+    // the `admin_allowed_ips` whitelist middleware below.
 
     // IP whitelist middleware for admin endpoints
     if !allowed.is_empty() {
@@ -105,6 +111,15 @@ struct CreateRouteBody {
     port: u16,
 }
 
+#[derive(Deserialize)]
+struct ProbeRequest {
+    /// "host:port" — loopback is allowed (see `health::probe_classify`).
+    addr: String,
+    /// Optional TCP connect timeout in seconds (default: health config).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct CreateRouteResponse {
     status: String,
@@ -160,4 +175,28 @@ async fn delete_route(
     state.router.remove_route(&email);
     tracing::info!(email = %email, "Route deleted via API");
     (StatusCode::OK, "ok").into_response()
+}
+
+/// On-demand reachability probe (2026-10-13, owner ruling "bridge 主动探针
+/// API"). Used by the CLI install webhook plan for the second hop
+/// (BRIDGE_HOST → agent inbound target). Returns a classified outcome —
+/// the caller interprets the class (`connected` / `connection_refused` =
+/// path open; `timeout` / `unreachable` = path closed).
+async fn probe(
+    State(state): State<AdminState>,
+    Json(req): Json<ProbeRequest>,
+) -> impl IntoResponse {
+    let addr = req.addr.trim().to_string();
+    if addr.is_empty() {
+        return (StatusCode::BAD_REQUEST, "addr is required").into_response();
+    }
+    let timeout = req.timeout_secs.unwrap_or(state.config.health.connect_timeout_sec);
+    let result = crate::health::probe_classify(&addr, timeout).await;
+    tracing::info!(
+        addr = %addr,
+        reachable = result["reachable"].as_bool().unwrap_or(false),
+        error = %result["error"].as_str().unwrap_or("unknown"),
+        "On-demand probe"
+    );
+    (StatusCode::OK, Json(result)).into_response()
 }

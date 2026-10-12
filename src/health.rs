@@ -157,25 +157,65 @@ fn route_target_key(r: &crate::router::ProfileRoute) -> String {
     format!("{}:{}", authority, port)
 }
 
-/// TCP probe: connect to host:port with timeout.
-async fn probe_target(host: &str, port: u16, timeout_secs: u64) -> bool {
-    let addr = format!("{}:{}", host, port);
+/// TCP probe classified (2026-10-13, owner ruling "bridge 主动探针 API").
+///
+/// Pure classifier for the on-demand `POST /api/v1/probe` admin endpoint —
+/// the CLI's install webhook plan (second hop: BRIDGE_HOST → agent inbound
+/// target) interprets the class:
+/// - `connected` / `connection_refused` ⇒ the path is open (refused = the
+///   agent process is not listening yet; it starts after install),
+/// - `timeout` / `unreachable` ⇒ the path is closed.
+///
+/// Unlike the gateway's probe-webhook, **loopback targets are allowed here**:
+/// a local bridge (or an external bridge on this same machine) legitimately
+/// probes a route target on 127.0.0.1. The endpoint is IP-whitelisted via
+/// `admin_allowed_ips` (AUDIT-1 D1), which is the access control for it.
+///
+/// The periodic route-health loop keeps its own service-level semantics
+/// (any non-connected outcome counts as a failure toward route cleanup).
+pub(crate) async fn probe_classify(addr: &str, timeout_secs: u64) -> serde_json::Value {
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        TcpStream::connect(&addr),
+        TcpStream::connect(addr),
     )
     .await
     {
-        Ok(Ok(_)) => true,
+        Ok(Ok(_)) => serde_json::json!({
+            "reachable": true,
+            "error": "connected",
+        }),
         Ok(Err(e)) => {
+            let error = if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                "connection_refused"
+            } else {
+                "unreachable"
+            };
             tracing::debug!(target = %addr, error = %e, "TCP probe failed");
-            false
+            serde_json::json!({
+                "reachable": false,
+                "error": error,
+                "detail": e.to_string(),
+            })
         }
         Err(_) => {
             tracing::debug!(target = %addr, "TCP probe timed out");
-            false
+            serde_json::json!({
+                "reachable": false,
+                "error": "timeout",
+                "detail": format!("connect timeout after {timeout_secs}s"),
+            })
         }
     }
+}
+
+/// TCP probe: connect to host:port with timeout.
+async fn probe_target(host: &str, port: u16, timeout_secs: u64) -> bool {
+    let addr = format!("{host}:{port}");
+    probe_classify(&addr, timeout_secs)
+        .await
+        .get("reachable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -224,5 +264,35 @@ mod tests {
         router.update_route("e@x.com", "127.0.0.1", 8645);
         let r = router.list_routes().pop().unwrap();
         assert_eq!(route_target_key(&r), "127.0.0.1:8645");
+    }
+
+    // 2026-10-13: the on-demand probe classifier (POST /api/v1/probe) must
+    // allow loopback — a local bridge probing a local agent inbound endpoint
+    // is the normal S2 case.
+    #[tokio::test]
+    async fn probe_classify_loopback_listener_is_connected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let res = probe_classify(&addr, 3).await;
+        assert_eq!(res["reachable"], serde_json::json!(true));
+        assert_eq!(res["error"], serde_json::json!("connected"));
+    }
+
+    #[tokio::test]
+    async fn probe_classify_closed_loopback_port_is_connection_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let res = probe_classify(&addr, 3).await;
+        assert_eq!(res["reachable"], serde_json::json!(false));
+        assert_eq!(res["error"], serde_json::json!("connection_refused"));
+    }
+
+    #[tokio::test]
+    async fn probe_classify_unroutable_target_times_out() {
+        // 240.0.0.0/4 — IETF protocol assignment, no route ⇒ timeout class.
+        let res = probe_classify("240.0.0.1:9", 1).await;
+        assert_eq!(res["reachable"], serde_json::json!(false));
+        assert_eq!(res["error"], serde_json::json!("timeout"));
     }
 }

@@ -90,8 +90,9 @@ pub enum ProbeOutcome {
 ///
 /// Inputs: `override_mode` (kill switch), `probe` (None = no probe was
 /// performed this round — a stream-state reconnect; Some = probe result),
-/// `streak` (consecutive stream transport-error drops since the last
-/// successful stream).
+/// `streak` (consecutive mid-stream transport-error drops since the
+/// last healthy stream rotation / re-probe recovery / downgrade — only
+/// a healthy round breaks the streak).
 ///
 /// Outputs: `(mode, delay_secs)`. delay 0 = act immediately.
 pub fn decide_next(
@@ -492,8 +493,10 @@ enum StreamRoundResult {
 }
 
 /// One stream round: (re)connect, then read until the stream ends.
-/// Owns `stream_streak` (reset on successful connect; advanced on
-/// transport drops; `decide_next` decides downgrade vs backoff).
+/// Owns `stream_streak` (advanced on mid-stream transport drops; reset
+/// on a healthy rotation, re-probe recovery, or downgrade — only a
+/// healthy round breaks the streak; `decide_next` decides backoff vs
+/// downgrade).
 #[allow(clippy::too_many_arguments)] // state-machine context, deliberately flat
 async fn run_stream_round(
     state: &PullState,
@@ -517,7 +520,6 @@ async fn run_stream_round(
             return StreamRoundResult::DropToPoll;
         }
     };
-    *stream_streak = 0;
     stream_round_with(
         state,
         tuning,
@@ -546,7 +548,13 @@ async fn stream_round_with(
 ) -> StreamRoundResult {
     match stream_read_loop(state, tuning, shutdown, seen, ack_failures, resp).await {
         StreamEnd::Stopped => StreamRoundResult::Stop,
-        StreamEnd::Closed => StreamRoundResult::Stay, // 300s rotation: immediate reconnect
+        StreamEnd::Closed => {
+            // Server closed at its max life: a HEALTHY round. Only a
+            // healthy rotation breaks the transport-error streak (a
+            // fresh drop run starts from 1); reconnect now.
+            *stream_streak = 0;
+            StreamRoundResult::Stay
+        }
         StreamEnd::Stalled => {
             tracing::warn!(
                 ping_timeout_ms = tuning.ping_timeout.as_millis() as u64,
@@ -813,7 +821,7 @@ pub async fn start_pull_loop_with_mode(
                         tracing::info!(
                             "stream endpoint available again — switching to stream mode"
                         );
-                        stream_streak = 0;
+                        stream_streak = 0; // recovery: fresh stream run starts clean
                         in_poll = false;
                         // Fall through to the stream branch with this
                         // already-open connection (one round this loop).
@@ -1380,6 +1388,29 @@ mod tests {
         format!("event: mail\ndata: {}\n\n", payload)
     }
 
+    // ── Mock server: raw TCP, per-connection /stream script ───────────
+    //
+    // Raw TCP (not axum) is deliberate: the transport-error act needs a
+    // real TCP RST mid-read (`TcpStream::abort()`) — a clean close is a
+    // healthy rotation, and a content-length mismatch is rejected at
+    // connect time, never mid-stream.
+
+    /// Per-connection /stream behavior.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum StreamAct {
+        /// 200 + SSE content-type, no data, hold open (stall test).
+        Hold,
+        /// 200 + one mail frame, hold open (healthy long-lived stream).
+        Healthy,
+        /// 200 + one mail frame, clean close (server max-life rotation).
+        Eof,
+        /// 200 + one ping chunk, then TCP RST (mid-stream transport
+        /// error — the only deterministic way to reach that path).
+        Rst,
+        /// Plain response status (probe rejection).
+        Status(u16),
+    }
+
     #[derive(Clone)]
     struct Mock {
         hits_pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1388,14 +1419,23 @@ mod tests {
         ack_rounds: Arc<std::sync::atomic::AtomicUsize>,
         forwarded: Arc<std::sync::Mutex<Vec<String>>>,
         pending_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-        /// None = 200 + text/event-stream; Some = plain response status.
-        stream_status: Option<u16>,
-        /// When true the stream sends one mail frame, then holds open.
-        stream_sends_mail: bool,
+        /// Scripted per-connection acts; Hold once the script is
+        /// exhausted.
+        script: Arc<std::sync::Mutex<std::collections::VecDeque<StreamAct>>>,
     }
 
     impl Mock {
+        /// Single-act mock (the pre-script tests).
         fn new(stream_status: Option<u16>, stream_sends_mail: bool) -> Self {
+            let act = match stream_status {
+                Some(code) => StreamAct::Status(code),
+                None if stream_sends_mail => StreamAct::Healthy,
+                None => StreamAct::Hold,
+            };
+            Self::with_script(vec![act])
+        }
+
+        fn with_script(script: Vec<StreamAct>) -> Self {
             Self {
                 hits_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 hits_stream: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1403,9 +1443,16 @@ mod tests {
                 ack_rounds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 forwarded: Arc::new(std::sync::Mutex::new(Vec::new())),
                 pending_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
-                stream_status,
-                stream_sends_mail,
+                script: Arc::new(std::sync::Mutex::new(script.into_iter().collect())),
             }
+        }
+
+        fn next_stream_act(&self) -> StreamAct {
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(StreamAct::Hold)
         }
     }
 
@@ -1439,129 +1486,194 @@ mod tests {
         }
     }
 
-    /// Bind the mock router on 127.0.0.1:0 and serve it; returns the
-    /// base URL and the original (still-cloneable) mock.
+    /// A raw-HTTP response: head (status + headers + CRLFCRLF), optional
+    /// body, and the after-body connection action.
+    enum After {
+        Close,
+        Abort,
+        Hold,
+    }
+
+    struct RawResp {
+        head: String,
+        body: Option<Vec<u8>>,
+        after: After,
+    }
+
+    impl RawResp {
+        fn json(v: &serde_json::Value) -> Self {
+            let b = v.to_string();
+            Self {
+                head: format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    b.len()
+                ),
+                body: Some(b.into_bytes()),
+                after: After::Close,
+            }
+        }
+
+        fn act(a: StreamAct) -> Self {
+            const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+            match a {
+                StreamAct::Status(code) => Self {
+                    head: format!(
+                        "HTTP/1.1 {code} ERR\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ),
+                    body: None,
+                    after: After::Close,
+                },
+                StreamAct::Hold => Self {
+                    head: SSE_HEAD.into(),
+                    body: None,
+                    after: After::Hold,
+                },
+                StreamAct::Healthy => Self {
+                    head: SSE_HEAD.into(),
+                    body: Some(frame_mail(7).into_bytes()),
+                    after: After::Hold,
+                },
+                StreamAct::Eof => Self {
+                    head: SSE_HEAD.into(),
+                    body: Some(frame_mail(7).into_bytes()),
+                    after: After::Close,
+                },
+                StreamAct::Rst => {
+                    // Chunked body with NO final 0-size chunk: the
+                    // client reads the ping chunk, then hits EOF while
+                    // parsing the next chunk size ⇒ a deterministic
+                    // mid-stream transport error (no RST dependency).
+                    let head =
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+                            .to_string();
+                    let chunk = "8\r\n: ping\n\n\r\n".to_string();
+                    Self {
+                        head,
+                        body: Some(chunk.into_bytes()),
+                        after: After::Abort,
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Handle one raw-HTTP request: parse (request line + headers +
+    /// body), route, write the response, then apply the connection
+    /// action.
+    async fn mock_handle_conn(mut stream: tokio::net::TcpStream, m: Mock) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut header_end: Option<usize> = None;
+        while header_end.is_none() {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            header_end = find_sub(&buf, b"\r\n\r\n");
+        }
+        let he = header_end.unwrap();
+        let head = String::from_utf8_lossy(&buf[..he]);
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap_or_default().to_string();
+        let mut content_length = 0usize;
+        for h in lines {
+            if let Some((k, v)) = h.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        while buf.len() < he + 4 + content_length {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body = &buf[he + 4..(he + 4 + content_length).min(buf.len())];
+
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+
+        let resp = if method == "GET" && path == "/api/v1/admin/pending/stream" {
+            m.hits_stream.fetch_add(1, Ordering::SeqCst);
+            RawResp::act(m.next_stream_act())
+        } else if method == "POST" && path == "/api/v1/admin/pending" {
+            m.hits_pending.fetch_add(1, Ordering::SeqCst);
+            let v: serde_json::Value =
+                serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
+            m.pending_bodies.lock().unwrap().push(v);
+            RawResp::json(&serde_json::json!({"batches": [{
+                "body": {"subject": "hi"},
+                "deliveries": [{"id": 7, "email": "a@x.com", "headers": {}}]
+            }]}))
+        } else if method == "POST" && path == "/api/v1/admin/pending/ack" {
+            let v: serde_json::Value =
+                serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
+            let ids: Vec<i64> = v
+                .get("ids")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                .unwrap_or_default();
+            m.acked.lock().unwrap().extend(ids.clone());
+            m.ack_rounds.fetch_add(1, Ordering::SeqCst);
+            RawResp::json(&serde_json::json!({ "acked": ids.len() }))
+        } else if method == "POST" && path == "/target" {
+            m.forwarded
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(body).to_string());
+            RawResp::json(&serde_json::json!({ "ok": true }))
+        } else {
+            RawResp {
+                head: "HTTP/1.1 404 NOT FOUND\r\ncontent-length: 2\r\nconnection: close\r\n\r\n"
+                    .into(),
+                body: Some(b"nf".to_vec()),
+                after: After::Close,
+            }
+        };
+
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(resp.head.as_bytes()).await?;
+        stream.flush().await?;
+        if let Some(b) = &resp.body {
+            stream.write_all(b).await?;
+            stream.flush().await?;
+        }
+        match resp.after {
+            After::Abort => {
+                // Let the chunked bytes arrive, then close WITHOUT the
+                // final chunk ⇒ the client's next read is an error.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            After::Hold => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            After::Close => {}
+        }
+        Ok(())
+    }
+
+    /// Bind the raw-TCP mock on 127.0.0.1:0; returns the base URL and a
+    /// still-cloneable handle to the shared counters.
     async fn bind_mock(m: Mock) -> (String, Mock) {
-        let m_pending = m.clone();
-        let m_ack = m.clone();
-        let m_stream = m.clone();
-        let m_target = m.clone();
-        let router =
-            axum::Router::new()
-                .route(
-                    "/api/v1/admin/pending",
-                    axum::routing::post(move |b: axum::extract::Json<serde_json::Value>| {
-                        let m = m_pending.clone();
-                        async move {
-                            m.hits_pending.fetch_add(1, Ordering::SeqCst);
-                            m.pending_bodies.lock().unwrap().push(b.0);
-                            Ok::<_, axum::http::StatusCode>(axum::extract::Json(
-                                serde_json::json!({
-                                    "batches": [{
-                                        "body": {"subject": "hi"},
-                                        "deliveries": [{"id": 7, "email": "a@x.com", "headers": {}}]
-                                    }]
-                                }),
-                            ))
-                        }
-                    }),
-                )
-                .route(
-                    "/api/v1/admin/pending/ack",
-                    axum::routing::post(move |b: axum::extract::Json<serde_json::Value>| {
-                        let m = m_ack.clone();
-                        async move {
-                            let ids: Vec<i64> =
-                                b.0.get("ids")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
-                                    .unwrap_or_default();
-                            m.acked.lock().unwrap().extend(ids.clone());
-                            m.ack_rounds.fetch_add(1, Ordering::SeqCst);
-                            Ok::<_, axum::http::StatusCode>(axum::extract::Json(
-                                serde_json::json!({ "acked": ids.len() }),
-                            ))
-                        }
-                    }),
-                )
-                .route(
-                    "/api/v1/admin/pending/stream",
-                    axum::routing::get(move || {
-                        let m = m_stream.clone();
-                        async move {
-                            m.hits_stream.fetch_add(1, Ordering::SeqCst);
-                            let status = m.stream_status;
-                            match status {
-                                None => {
-                                    let send_mail = m.stream_sends_mail;
-                                    #[derive(Clone, Copy)]
-                                    enum St {
-                                        Start,
-                                        Holding,
-                                    }
-                                    let body =
-                                        futures_util::stream::unfold(St::Start, move |state| {
-                                            async move {
-                                                match state {
-                                                    St::Start if send_mail => {
-                                                        tokio::time::sleep(Duration::from_millis(
-                                                            100,
-                                                        ))
-                                                        .await;
-                                                        Some((
-                                                            Ok::<
-                                                                axum::body::Bytes,
-                                                                std::convert::Infallible,
-                                                            >(
-                                                                axum::body::Bytes::from(
-                                                                    frame_mail(7),
-                                                                ),
-                                                            ),
-                                                            St::Holding,
-                                                        ))
-                                                    }
-                                                    _ => {
-                                                        // Hold the connection open until dropped.
-                                                        tokio::time::sleep(Duration::from_secs(
-                                                            3600,
-                                                        ))
-                                                        .await;
-                                                        None
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    axum::response::Response::builder()
-                                        .status(axum::http::StatusCode::OK)
-                                        .header("content-type", "text/event-stream")
-                                        .header("x-accel-buffering", "no")
-                                        .body(axum::body::Body::from_stream(body))
-                                        .unwrap()
-                                }
-                                Some(status) => axum::response::Response::builder()
-                                    .status(axum::http::StatusCode::from_u16(status).unwrap())
-                                    .body(axum::body::Body::empty())
-                                    .unwrap(),
-                            }
-                        }
-                    }),
-                )
-                .route(
-                    "/target",
-                    axum::routing::post(move |b: String| {
-                        let m = m_target.clone();
-                        async move {
-                            m.forwarded.lock().unwrap().push(b);
-                            Ok::<_, axum::http::StatusCode>(axum::extract::Json(
-                                serde_json::json!({ "ok": true }),
-                            ))
-                        }
-                    }),
-                );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let value = m.clone();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            while let Ok((stream, _)) = listener.accept().await {
+                let m2 = value.clone();
+                tokio::spawn(async move {
+                    let _ = mock_handle_conn(stream, m2).await;
+                });
+            }
         });
         (format!("http://{addr}"), m)
     }
@@ -1696,6 +1808,88 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(1500),
             "two non-empty ack rounds took {elapsed:?} — the loop slept between them"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_errors_downgrade_after_3_drops() {
+        // Three mid-stream transport errors in a row: the streak must
+        // persist ACROSS reconnects (only a healthy round breaks it)
+        // and reach 3 ⇒ auto downgrades to long-pull (plan 0.3).
+        let (url, m) = bind_mock(Mock::with_script(vec![
+            StreamAct::Rst,
+            StreamAct::Rst,
+            StreamAct::Rst,
+        ]))
+        .await;
+        let router = new_router("miderr");
+        router.update_route("a@x.com", &format!("{url}/target"), 0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+
+        let task = tokio::spawn(start_pull_loop_with_mode(
+            test_cfg(&url),
+            router,
+            shutdown.clone(),
+            PullMode::Auto,
+            test_tuning(),
+        ));
+        let ok = wait_for(Duration::from_secs(20), || {
+            m.hits_pending.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let elapsed = start.elapsed();
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        assert!(
+            ok,
+            "3 consecutive mid-stream errors must downgrade to long-pull"
+        );
+        assert!(
+            m.hits_stream.load(Ordering::SeqCst) >= 3,
+            "streak must persist across reconnects (>=3 connect attempts)"
+        );
+        // Backoffs before the downgrade are 1s + 2s: it must land far
+        // below the re-probe interval (1h in test_tuning).
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "downgrade took {elapsed:?} — the streak is not persisting"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_rotation_resets_stream_streak() {
+        // RST, healthy rotation (Eof), RST, RST: three transport errors
+        // in total, but the healthy round RESETS the streak ⇒ the peak
+        // streak is 2 ⇒ NO downgrade (plan 0.3: only CONSECUTIVE drops).
+        let (url, m) = bind_mock(Mock::with_script(vec![
+            StreamAct::Rst,
+            StreamAct::Eof,
+            StreamAct::Rst,
+            StreamAct::Rst,
+        ]))
+        .await;
+        let router = new_router("healthyreset");
+        router.update_route("a@x.com", &format!("{url}/target"), 0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(start_pull_loop_with_mode(
+            test_cfg(&url),
+            router,
+            shutdown.clone(),
+            PullMode::Auto,
+            test_tuning(),
+        ));
+        let ok = wait_for(Duration::from_secs(20), || {
+            m.hits_stream.load(Ordering::SeqCst) >= 4
+        })
+        .await;
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        assert!(ok, "expected 4 stream connects (3 errors + 1 rotation)");
+        assert!(
+            m.hits_pending.load(Ordering::SeqCst) == 0,
+            "a healthy rotation must reset the streak — no downgrade allowed"
         );
     }
 }

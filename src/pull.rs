@@ -405,10 +405,53 @@ async fn forward_and_ack(
 
 // ── Stream path ────────────────────────────────────────────────────────
 
-/// Open the SSE connection (signed GET, empty body). Ok = 200 +
-/// text/event-stream. The 30s bound is for the CONNECT phase only; the
-/// long-lived body is guarded per-chunk inside `stream_read_loop`.
-async fn connect_stream(state: &PullState) -> Result<reqwest::Response, ()> {
+/// Stable-per-process client identity (RFC 4122 UUID-v4 layout) for the
+/// gateway single-slot mailbox lock. Generated once per process; the gateway
+/// treats it as an opaque, equality-compared string (first connection wins;
+/// the same id re-acquires, a different id gets 409). Reuses `sha2` from the
+/// existing dependency tree — no new dependency.
+fn client_id() -> &'static str {
+    use std::sync::OnceLock;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(std::process::id().to_le_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        h.update(now.as_nanos().to_le_bytes());
+        h.update(format!("aimail-bridge/{}", std::process::id()).as_bytes());
+        let d = h.finalize();
+        let mut u = [0u8; 16];
+        u.copy_from_slice(&d[..16]);
+        u[6] = (u[6] & 0x0f) | 0x40; // version 4
+        u[8] = (u[8] & 0x3f) | 0x80; // variant 10
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9],
+            u[10], u[11], u[12], u[13], u[14], u[15]
+        )
+    })
+}
+
+/// Outcome of a stream connect against the single-slot lock.
+enum ConnectOutcome {
+    /// 200 + text/event-stream — the stream is ours.
+    Ok(reqwest::Response),
+    /// 409 — another client holds this key's single-slot mailbox.
+    Occupied,
+    /// 404/405/5xx/network — the stream endpoint is unavailable.
+    Unavailable,
+}
+
+/// Open the SSE connection (signed GET, empty body). `Ok` = 200 +
+/// text/event-stream (the stream is ours); `Occupied` = 409 (another client
+/// holds this key's single-slot mailbox — stay in the current mode and retry);
+/// `Unavailable` = 404/405/5xx/network (the endpoint is absent). The 30s bound
+/// is for the CONNECT phase only; the long-lived body is guarded per-chunk
+/// inside `stream_read_loop`.
+async fn connect_stream(state: &PullState) -> ConnectOutcome {
     // STREAM_PATH carries its leading slash, so join WITHOUT adding one
     // (a double slash would 404 against the real route registration).
     let url = format!(
@@ -423,12 +466,18 @@ async fn connect_stream(state: &PullState) -> Result<reqwest::Response, ()> {
         .get(&url)
         .header("X-Api-Identity", state.pull_cfg.system_id.as_str())
         .header("X-Api-Timestamp", ts)
-        .header("X-Api-Signature", sig);
+        .header("X-Api-Signature", sig)
+        .header("X-Aimail-Client", client_id());
 
-    let resp = tokio::time::timeout(Duration::from_secs(30), req.send())
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+    let resp = match tokio::time::timeout(Duration::from_secs(30), req.send()).await {
+        Ok(Ok(r)) => r,
+        _ => return ConnectOutcome::Unavailable,
+    };
+
+    // 409 = occupied: the single-slot lock is held by another client.
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        return ConnectOutcome::Occupied;
+    }
 
     let ok = resp.status().is_success()
         && resp
@@ -438,9 +487,9 @@ async fn connect_stream(state: &PullState) -> Result<reqwest::Response, ()> {
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
     if !ok {
         tracing::debug!(status = %resp.status(), "stream probe rejected by server");
-        return Err(());
+        return ConnectOutcome::Unavailable;
     }
-    Ok(resp)
+    ConnectOutcome::Ok(resp)
 }
 
 /// Read the stream until it ends, forwarding each mail event.
@@ -506,10 +555,44 @@ async fn run_stream_round(
     seen: &mut HashMap<i64, Instant>,
     ack_failures: &mut u32,
     stream_streak: &mut u32,
+    occupied_streak: &mut u32,
 ) -> StreamRoundResult {
-    let resp = match connect_stream(state).await {
-        Ok(r) => r,
-        Err(()) => {
+    match connect_stream(state).await {
+        ConnectOutcome::Ok(resp) => {
+            // A successful connect means the slot is free: reset the
+            // occupied backoff ramp (a fresh occupied run starts from 1).
+            *occupied_streak = 0;
+            stream_round_with(
+                state,
+                tuning,
+                override_mode,
+                shutdown,
+                seen,
+                ack_failures,
+                stream_streak,
+                resp,
+            )
+            .await
+        }
+        ConnectOutcome::Occupied => {
+            // Single-slot lock held by ANOTHER client: stay in the current
+            // mode (NO downgrade — the slot frees via the holder's
+            // lease/grace) and retry the SAME endpoint with the stream
+            // backoff ramp. Not a transport error ⇒ the transport streak is
+            // untouched (no downgrade path is ever triggered).
+            let delay = stream_backoff_secs(*occupied_streak);
+            *occupied_streak += 1;
+            tracing::info!(
+                backoff_secs = delay,
+                streak = *occupied_streak,
+                "stream slot occupied by another client — staying in stream mode, retrying after backoff"
+            );
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+            StreamRoundResult::Stay
+        }
+        ConnectOutcome::Unavailable => {
             // Unavailable (404/500/network) — routed through the shared
             // decision function: every mode drops to long-pull (there is
             // no alternative transport); the poll-state re-probe recovers
@@ -517,20 +600,9 @@ async fn run_stream_round(
             let (next, _) = decide_next(override_mode, Some(ProbeOutcome::Unavailable), 0);
             debug_assert_eq!(next, PullMode::Poll, "unavailable must drop to poll");
             tracing::info!("stream endpoint unavailable — falling back to long-poll");
-            return StreamRoundResult::DropToPoll;
+            StreamRoundResult::DropToPoll
         }
-    };
-    stream_round_with(
-        state,
-        tuning,
-        override_mode,
-        shutdown,
-        seen,
-        ack_failures,
-        stream_streak,
-        resp,
-    )
-    .await
+    }
 }
 
 /// Read an ALREADY-CONNECTED stream until it ends, applying the same
@@ -680,6 +752,7 @@ async fn fetch_pending(
         .header("X-Api-Identity", state.pull_cfg.system_id.as_str())
         .header("X-Api-Timestamp", ts)
         .header("X-Api-Signature", sig)
+        .header("X-Aimail-Client", client_id())
         .header("content-type", "application/json")
         .body(body_bytes)
         .send()
@@ -772,6 +845,7 @@ pub async fn start_pull_loop_with_mode(
     let mut consecutive_failures: u32 = 0;
     let mut ack_failures: u32 = 0;
     let mut stream_streak: u32 = 0;
+    let mut occupied_streak: u32 = 0;
     // "Due immediately" so the first empty Poll round re-probes right away.
     let mut last_reprobe = Instant::now() - tuning.reprobe_interval;
 
@@ -814,7 +888,7 @@ pub async fn start_pull_loop_with_mode(
             last_reprobe = Instant::now();
             {
                 match connect_stream(&state).await {
-                    Ok(resp) => {
+                    ConnectOutcome::Ok(resp) => {
                         let (next, _) =
                             decide_next(override_mode, Some(ProbeOutcome::Ready), stream_streak);
                         debug_assert_eq!(next, PullMode::Stream, "ready must enter stream");
@@ -847,8 +921,10 @@ pub async fn start_pull_loop_with_mode(
                             }
                         }
                     }
-                    Err(()) => {
-                        // Still unavailable: sleep the round out.
+                    ConnectOutcome::Occupied | ConnectOutcome::Unavailable => {
+                        // Occupied (another client holds the slot) or
+                        // unavailable: sleep the round out — stay in the
+                        // poll fallback either way.
                         tokio::time::sleep(Duration::from_secs(poll_interval)).await;
                         continue;
                     }
@@ -866,6 +942,7 @@ pub async fn start_pull_loop_with_mode(
                 &mut seen,
                 &mut ack_failures,
                 &mut stream_streak,
+                &mut occupied_streak,
             )
             .await
             {
@@ -1415,6 +1492,10 @@ mod tests {
     struct Mock {
         hits_pending: Arc<std::sync::atomic::AtomicUsize>,
         hits_stream: Arc<std::sync::atomic::AtomicUsize>,
+        /// First X-Aimail-Client header observed (any request).
+        client_header: Arc<std::sync::Mutex<Option<String>>>,
+        /// Ordered request events: 'S' = /stream hit, 'P' = /pending hit.
+        events: Arc<std::sync::Mutex<Vec<u8>>>,
         acked: Arc<std::sync::Mutex<Vec<i64>>>,
         ack_rounds: Arc<std::sync::atomic::AtomicUsize>,
         forwarded: Arc<std::sync::Mutex<Vec<String>>>,
@@ -1439,6 +1520,8 @@ mod tests {
             Self {
                 hits_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 hits_stream: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                client_header: Arc::new(std::sync::Mutex::new(None)),
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
                 acked: Arc::new(std::sync::Mutex::new(Vec::new())),
                 ack_rounds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 forwarded: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1586,6 +1669,11 @@ mod tests {
             if let Some((k, v)) = h.split_once(':') {
                 if k.trim().eq_ignore_ascii_case("content-length") {
                     content_length = v.trim().parse().unwrap_or(0);
+                } else if k.trim().eq_ignore_ascii_case("x-aimail-client") {
+                    let mut cur = m.client_header.lock().unwrap();
+                    if cur.is_none() {
+                        *cur = Some(v.trim().to_string());
+                    }
                 }
             }
         }
@@ -1604,9 +1692,11 @@ mod tests {
 
         let resp = if method == "GET" && path == "/api/v1/admin/pending/stream" {
             m.hits_stream.fetch_add(1, Ordering::SeqCst);
+            m.events.lock().unwrap().push(b'S');
             RawResp::act(m.next_stream_act())
         } else if method == "POST" && path == "/api/v1/admin/pending" {
             m.hits_pending.fetch_add(1, Ordering::SeqCst);
+            m.events.lock().unwrap().push(b'P');
             let v: serde_json::Value =
                 serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
             m.pending_bodies.lock().unwrap().push(v);
@@ -1771,6 +1861,89 @@ mod tests {
             "stalled stream must downgrade to long-pull (and still deliver)"
         );
         assert!(m.hits_pending.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Single-slot: repeated 409 (occupied) must NOT degrade to long-poll —
+    /// the client stays in stream mode and backoffs against the SAME
+    /// /stream endpoint until the slot frees, then delivers. Asserted as
+    /// zero /pending hits for the whole run.
+    #[tokio::test]
+    async fn sse_409_occupied_stays_in_stream_and_delivers() {
+        let (url, m) = bind_mock(Mock::with_script(vec![
+            StreamAct::Status(409),
+            StreamAct::Status(409),
+            StreamAct::Healthy,
+        ]))
+        .await;
+        let router = new_router("occupied_stays");
+        router.update_route("a@x.com", &format!("{url}/target"), 0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(start_pull_loop_with_mode(
+            test_cfg(&url),
+            router,
+            shutdown.clone(),
+            PullMode::Auto,
+            test_tuning(),
+        ));
+        // Two 409 rounds (1s + 2s backoff) then the stream delivers mail 7.
+        let ok = wait_for(Duration::from_secs(15), || {
+            m.acked.lock().unwrap().contains(&7)
+        })
+        .await;
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        assert!(ok, "mail must deliver once the slot frees");
+        // The FIRST THREE requests must all be stream connects (409, 409, 200):
+        // while occupied the client never touches the long-poll endpoint.
+        // (Any /pending hit AFTER the slot frees is the pre-existing
+        // silence-downgrade, unrelated to occupied.)
+        let ev = m.events.lock().unwrap().clone();
+        let prefix: Vec<u8> = ev.iter().take(3).copied().collect();
+        assert_eq!(
+            prefix,
+            vec![b'S', b'S', b'S'],
+            "occupied must stay in stream mode: first 3 events were {prefix:?}"
+        );
+    }
+
+    /// The single-slot client identity header (X-Aimail-Client) must be sent
+    /// on both the stream connect and the poll round, and be stable (one
+    /// process = one id).
+    #[tokio::test]
+    async fn client_id_header_sent_on_stream_and_poll() {
+        let (url, m) = bind_mock(Mock::new(Some(404), false)).await;
+        let router = new_router("client_hdr");
+        router.update_route("a@x.com", &format!("{url}/target"), 0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(start_pull_loop_with_mode(
+            test_cfg(&url),
+            router,
+            shutdown.clone(),
+            PullMode::Auto,
+            test_tuning(),
+        ));
+        let _ = wait_for(Duration::from_secs(10), || {
+            m.acked.lock().unwrap().contains(&7)
+        })
+        .await;
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        // A 404 probe degrades to poll, so both transports are exercised.
+        assert!(
+            m.hits_stream.load(Ordering::SeqCst) >= 1,
+            "stream connect must carry the client header"
+        );
+        assert!(
+            m.hits_pending.load(Ordering::SeqCst) >= 1,
+            "poll round must carry the client header"
+        );
+        let hdr = m.client_header.lock().unwrap().clone();
+        assert!(hdr.is_some(), "X-Aimail-Client header must be observed");
+        let id = hdr.unwrap();
+        assert_eq!(id.len(), 36, "expected UUID layout, got {id:?}");
+        assert!(id.contains('-'), "expected hyphenated UUID, got {id:?}");
     }
 
     #[tokio::test]
